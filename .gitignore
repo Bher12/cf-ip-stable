@@ -39,3 +39,8 @@ gen_sub.py
 # 运行时产物
 run_summary.json
 _run_live.out
+
+# 本机定时运行启动器（含本机绝对路径，仅本地使用）
+run_stable.bat
+run_stable.ps1
+create_task.ps1
