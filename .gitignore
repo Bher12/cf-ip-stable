@@ -1,0 +1,41 @@
+﻿config.json
+git_sync.ps1
+git_sync.sh
+__pycache__/
+.run.lock
+notify.log
+*.log
+
+# local backups / temp
+*.bak
+*.bak_*
+_run.err
+
+# generated subscription outputs
+v2rayn_sub.txt
+singbox_profile.json
+
+# local deployment notes & worker drafts
+新后端部署指南.txt
+workers/
+
+# diagnostic / one-off test scripts
+burst.py
+certcheck.ps1
+cmp.py
+full.py
+inspect_sub.py
+jscheck.py
+p80.py
+quick.py
+vless_diag.py
+vless_multi.py
+vless_test.py
+vless_test2.py
+vless_timing.py
+yt_test.py
+gen_sub.py
+
+# 运行时产物
+run_summary.json
+_run_live.out

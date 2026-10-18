@@ -1,0 +1,19 @@
+{
+  "_comment": "本文件仅作为稳定性参数参考。实际部署时，在文件夹内新建 config.json，只写你想覆盖的键即可（缺省项自动用内置默认值）。",
+  "_security": "config.json 含 Cloudflare / WxPusher 等凭证，已被 .gitignore 忽略，请勿提交。",
+  "STABILITY_ENABLED": true,
+  "STABILITY_STATE_FILE": "stability_state.json",
+  "STABILITY_EMA_ALPHA": 0.35,
+  "STABILITY_RECENT_N": 8,
+  "STABILITY_MIN_SAMPLES": 2,
+  "STABILITY_HYSTERESIS_RATIO": 0.15,
+  "STABILITY_CONFIRM_RUNS": 2,
+  "STABILITY_MAX_ABSENT_RUNS": 3,
+  "STABILITY_MIN_CONSISTENCY": 0.55,
+  "_preset_less_churn": "想更稳，可整体调大阻力：",
+  "_preset_less_churn_vals": {
+    "STABILITY_HYSTERESIS_RATIO": 0.25,
+    "STABILITY_CONFIRM_RUNS": 3,
+    "STABILITY_MAX_ABSENT_RUNS": 5
+  }
+}
