@@ -193,14 +193,16 @@ def _node_port(node_str):
     return m.group(1) if m else None
 
 
-def _ensure_ipv6_representation(final_selected, v6_pool):
-    """保证合并输出的 ip.txt 中始终含至少 IPV6_MIN_IN_OUTPUT 个 IPv6 节点。
+def _ensure_ipv6_representation(final_selected, v6_pool, min_v6=None):
+    """保证合并输出的 ip.txt 中始终含至少 min_v6 个 IPv6 节点。
 
     v6_pool: IPv6 候选池，元素为 (node, score)。优先用带带宽得分的节点；
     若带宽探测失败导致 scored_nodes 为空，则退回「已通过 TCP + HTTP /cdn-cgi/trace
     校验」的 IPv6 节点（已确属真实 Cloudflare 边缘），保证不丢 IPv6。
     若数量仍不足，用得分最高的 IPv6 顶替得分最低的 IPv4，腾出名额。"""
-    min_v6 = int(IPV6_MIN_IN_OUTPUT)
+    if min_v6 is None:
+        min_v6 = IPV6_MIN_IN_OUTPUT
+    min_v6 = int(min_v6)
     if min_v6 <= 0:
         return final_selected
     v6_in = [n for n in final_selected if _is_ipv6_node(n)]
@@ -218,6 +220,45 @@ def _ensure_ipv6_representation(final_selected, v6_pool):
     if not pool:
         return final_selected
     removable = sorted([n for n in final_selected if not _is_ipv6_node(n)],
+                       key=lambda n: best.get(n, 0.0))
+    result = list(final_selected)
+    added = 0
+    for node, _ in pool:
+        if added >= need:
+            break
+        if removable:
+            result.remove(removable.pop(0))
+        result.append(node)
+        added += 1
+    return result
+
+
+def _ensure_ipv4_representation(final_selected, v4_pool, min_v4=None):
+    """保证合并输出的 ip.txt 中始终含至少 min_v4 个 IPv4 节点。
+
+    _ensure_ipv6_representation 的对称逻辑：IPv6 保底解决"丢 IPv6"，
+    本函数解决"IPv4 被 IPv6 高分挤光"（2026-10-20 曾整表 17 个全 IPv6）。
+    v4_pool: IPv4 候选池，元素为 (node, score)；同样优先带宽得分，
+    数量不足时用得分最高的 IPv4 顶替得分最低的 IPv6 腾出名额。"""
+    if min_v4 is None:
+        min_v4 = IPV4_MIN_IN_OUTPUT
+    min_v4 = int(min_v4)
+    if min_v4 <= 0:
+        return final_selected
+    v4_in = [n for n in final_selected if not _is_ipv6_node(n)]
+    if len(v4_in) >= min_v4:
+        return final_selected
+    best = {}
+    for n, s in v4_pool:
+        if not _is_ipv6_node(n) and (n not in best or s > best[n]):
+            best[n] = s
+    pool = sorted(best.items(), key=lambda x: x[1], reverse=True)
+    selected = set(final_selected)
+    pool = [it for it in pool if it[0] not in selected]
+    need = min_v4 - len(v4_in)
+    if not pool:
+        return final_selected
+    removable = sorted([n for n in final_selected if _is_ipv6_node(n)],
                        key=lambda n: best.get(n, 0.0))
     result = list(final_selected)
     added = 0
@@ -575,6 +616,7 @@ def load_config():
         "IPV6_PLACEHOLDER_COUNTRY": "IPV6",
         "IPV6_CANDIDATE_RESERVE": 30,
         "IPV6_MIN_IN_OUTPUT": 5,
+        "IPV4_MIN_IN_OUTPUT": 10,
     }
 
     try:
@@ -721,6 +763,7 @@ IPV6_PORT = cfg["IPV6_PORT"]
 IPV6_PLACEHOLDER_COUNTRY = cfg["IPV6_PLACEHOLDER_COUNTRY"]
 IPV6_CANDIDATE_RESERVE = cfg["IPV6_CANDIDATE_RESERVE"]
 IPV6_MIN_IN_OUTPUT = cfg["IPV6_MIN_IN_OUTPUT"]
+IPV4_MIN_IN_OUTPUT = cfg["IPV4_MIN_IN_OUTPUT"]
 
 # 记录本次运行中发生硬降级的环节（该层完全失效、退化为上一层的原始结果）。
 # 只要出现过降级，写 ip.txt 时就要求产出不低于上次，否则保留旧结果。
@@ -2431,7 +2474,30 @@ def main():
     if 'scored_nodes' in locals():
         _v6_pool += [(n, s) for n, s, *_ in scored_nodes]
     _v6_pool += [(n, 0.0) for n in candidates_after_http if _is_ipv6_node(n)]
-    final_selected = _ensure_ipv6_representation(final_selected, _v6_pool)
+
+    # IPv4/IPv6 双保底：各自保证最低节点数。
+    # 保底之和超过输出总量（全局模式 GLOBAL_TOP_N）时等比缩减，避免互相挤爆。
+    _min_v6 = int(IPV6_MIN_IN_OUTPUT)
+    _min_v4 = int(IPV4_MIN_IN_OUTPUT)
+    _top_cap = int(GLOBAL_TOP_N) if USE_GLOBAL_MODE else max(1, _min_v4 + _min_v6)
+    if _min_v4 + _min_v6 > _top_cap:
+        _scale = _top_cap / float(_min_v4 + _min_v6)
+        _min_v4 = max(1, int(_min_v4 * _scale))
+        _min_v6 = max(1, int(_min_v6 * _scale))
+        print(f"\n[提示] IPv4/IPv6 保底之和超过输出上限 {_top_cap}，"
+              f"已等比缩减为 IPv4≥{_min_v4}、IPv6≥{_min_v6}。")
+    final_selected = _ensure_ipv6_representation(final_selected, _v6_pool, _min_v6)
+    _v4_pool = []
+    if 'scored_nodes' in locals():
+        _v4_pool += [(n, s) for n, s, *_ in scored_nodes if not _is_ipv6_node(n)]
+    _v4_pool += [(n, 0.0) for n in candidates_after_http if not _is_ipv6_node(n)]
+    final_selected = _ensure_ipv4_representation(final_selected, _v4_pool, _min_v4)
+    print(f"\n[规模控制] 输出目标 {_top_cap} 个，其中 IPv4≥{_min_v4}、IPv6≥{_min_v6}。")
+
+    # 注入的保底节点按得分重排，保持"最优在前"的展示顺序
+    if 'scored_nodes' in locals() and scored_nodes:
+        _score_map = {item[0]: float(item[1]) for item in scored_nodes}
+        final_selected.sort(key=lambda n: _score_map.get(n, 0.0), reverse=True)
 
     # IPv6 节点解析真实地区（仅展示用，放在全部筛选之后，不影响保活/过滤）
     _ipv6_geo = resolve_ipv6_countries(final_selected)
@@ -2495,6 +2561,26 @@ def main():
 
 if __name__ == "__main__":
     import atexit
+
+    # ---- [临时诊断] 启动身份记录：谁在用哪个副本运行本程序（排查结束后移除，勿提交）----
+    try:
+        import ctypes as _ct
+        _ppid = os.getppid()
+        _parent = "?"
+        _h = _ct.windll.kernel32.OpenProcess(0x1000, False, _ppid)
+        if _h:
+            _b = _ct.create_unicode_buffer(260)
+            _s = _ct.c_ulong(260)
+            if _ct.windll.kernel32.QueryFullProcessImageNameW(_h, 0, _b, _ct.byref(_s)):
+                _parent = _b.value
+            _ct.windll.kernel32.CloseHandle(_h)
+        sys.stderr.write("PROBE-MAIN file=%s cwd=%s pid=%d ppid=%d parent=%s at=%s\n" % (
+            os.path.abspath(__file__), os.getcwd(), os.getpid(), _ppid, _parent,
+            time.strftime("%Y-%m-%d %H:%M:%S")))
+        sys.stderr.flush()
+    except Exception as _e:
+        sys.stderr.write("PROBE-MAIN failed: %s\n" % _e)
+    # ------------------------------------------------------------------
 
     # ---- 单实例检查：已有实例在跑就直接退出 ----
     if not acquire_single_instance():
