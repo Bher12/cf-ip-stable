@@ -736,12 +736,41 @@ if FORCE_DIRECT:
 
 socket.setdefaulttimeout(SOCKET_DEFAULT_TIMEOUT)
 
-# ==================== 单实例锁（文件锁，跨平台） ====================
+# ==================== 单实例锁（命名互斥体 + 文件锁，双保险） ====================
 _LOCK_FILE_HANDLE = None
 _LOCK_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".run.lock")
+_MUTEX_HANDLE = None
+_MUTEX_NAME = "Global\\cf-ip-stable-single-instance"
+
+def _close_mutex():
+    global _MUTEX_HANDLE
+    if _MUTEX_HANDLE:
+        try:
+            import ctypes
+            ctypes.windll.kernel32.ReleaseMutex(_MUTEX_HANDLE)
+            ctypes.windll.kernel32.CloseHandle(_MUTEX_HANDLE)
+        except Exception:
+            pass
+        _MUTEX_HANDLE = None
 
 def acquire_single_instance():
-    global _LOCK_FILE_HANDLE
+    """双保险单实例防护：
+    1) Windows 命名互斥体（内核对象，不受文件系统虚拟化/沙箱影子副本影响，跨启动上下文可靠）
+    2) 文件字节锁（跨平台兜底）
+    任一检测到"已有实例"即返回 False。
+    """
+    global _LOCK_FILE_HANDLE, _MUTEX_HANDLE
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+            if handle:
+                if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    return False
+                _MUTEX_HANDLE = handle
+        except Exception:
+            pass  # 互斥体不可用时静默退回文件锁
     f = None
     try:
         f = open(_LOCK_FILE_PATH, "a+")
@@ -758,29 +787,34 @@ def acquire_single_instance():
                 f.close()
             except Exception:
                 pass
-        return False
+        # 文件锁拿不到：若互斥体已拿到（说明确实没有别的实例），仅告警不阻断；
+        # 否则说明已有实例在跑，返回 False
+        if _MUTEX_HANDLE is None:
+            return False
+        print("提示：文件锁获取失败（可能是沙箱/虚拟化环境），互斥体防护仍然有效。")
+        return True
     _LOCK_FILE_HANDLE = f
     return True
 
 def release_single_instance():
     global _LOCK_FILE_HANDLE
-    if _LOCK_FILE_HANDLE is None:
-        return
-    try:
-        if sys.platform == "win32":
-            import msvcrt
-            _LOCK_FILE_HANDLE.seek(0)
-            msvcrt.locking(_LOCK_FILE_HANDLE.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(_LOCK_FILE_HANDLE.fileno(), fcntl.LOCK_UN)
-    except Exception:
-        pass
-    try:
-        _LOCK_FILE_HANDLE.close()
-    except Exception:
-        pass
-    _LOCK_FILE_HANDLE = None
+    if _LOCK_FILE_HANDLE is not None:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                _LOCK_FILE_HANDLE.seek(0)
+                msvcrt.locking(_LOCK_FILE_HANDLE.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(_LOCK_FILE_HANDLE.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            _LOCK_FILE_HANDLE.close()
+        except Exception:
+            pass
+        _LOCK_FILE_HANDLE = None
+    _close_mutex()
     # 尝试删除锁文件，失败忽略（Windows 上可能被别的实例占用）
     try:
         os.remove(_LOCK_FILE_PATH)
