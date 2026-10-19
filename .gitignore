@@ -44,3 +44,6 @@ _run_live.out
 run_stable.bat
 run_stable.ps1
 create_task.ps1
+
+# IPv6 地理信息缓存（运行时产物，每次运行刷新）
+ipv6_geo_cache.json

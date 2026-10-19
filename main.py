@@ -16,6 +16,7 @@ import os
 import subprocess
 import shutil
 import json
+import random
 import asyncio
 import aiohttp
 import ipaddress
@@ -43,8 +44,260 @@ import stability_layer
 # ===========================================
 
 # ==================== 预编译正则 ====================
-NODE_PATTERN = re.compile(r"^(\d+\.\d+\.\d+\.\d+):(\d+)#(.+)$")
-IP_PORT_PATTERN = re.compile(r"^(\d+\.\d+\.\d+\.\d+):(\d+)#")
+# 同时支持 IPv4 与带方括号的 IPv6（[ipv6]:port[#country]）。
+_IPV4 = r"\d+\.\d+\.\d+\.\d+"
+_IPV6 = r"\[[0-9A-Fa-f:]+\]"
+NODE_PATTERN = re.compile(r"^(" + _IPV4 + r"|" + _IPV6 + r"):(\d+)#(.+)$")
+IP_PORT_PATTERN = re.compile(r"^(" + _IPV4 + r"|" + _IPV6 + r"):(\d+)#")
+
+
+# ----------------------------------------------------------------------------
+# IPv6 候选生成（Cloudflare IPv6 段随机采样）
+# IPv6 地址空间巨大无法全扫，按配置比例从 CF IPv6 段随机抽取，
+# 后续由 TCP/HTTP/带宽测试自动筛掉未宣告/不可达的地址。
+# ----------------------------------------------------------------------------
+def _tcp_open_v6(addr, port, timeout):
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((str(addr), int(port)))
+        return True
+    except Exception:
+        return False
+
+
+def _discover_ipv6_seeds():
+    """解析 Cloudflare 主机名 AAAA 记录拿到『确定可达』的 IPv6 种子地址；
+    若解析失败（如环境无 IPv6 DNS）则退回内置种子。返回 IPv6Address 列表。"""
+    hosts = cfg.get("IPV6_SEED_HOSTS") or ["speed.cloudflare.com", "www.cloudflare.com", "cloudflare.com"]
+    seeds = []
+    seen = set()
+    for h in hosts:
+        try:
+            infos = socket.getaddrinfo(h, 443, socket.AF_INET6, socket.SOCK_STREAM)
+            for info in infos:
+                ip = info[4][0]
+                if ":" in ip and not ip.startswith("::ffff:"):
+                    a = ipaddress.ip_address(ip)
+                    if a not in seen:
+                        seen.add(a)
+                        seeds.append(a)
+        except Exception:
+            continue
+    if not seeds:
+        for s in (cfg.get("IPV6_FALLBACK_SEEDS") or []):
+            try:
+                a = ipaddress.ip_address(s)
+                if a not in seen:
+                    seen.add(a)
+                    seeds.append(a)
+            except Exception:
+                continue
+    return seeds
+
+
+def _discover_live_prefixes(seeds):
+    """对每个种子所在 /48，扫描其 256 个 /64，返回『可达』的 /64 前缀列表。"""
+    if not seeds:
+        return []
+    workers = int(IPV6_SCAN_WORKERS)
+    timeout = float(IPV6_SCAN_TIMEOUT)
+    tgt48 = []
+    seen48 = set()
+    for s in seeds:
+        try:
+            # strict=False 掩掉主机位，使种子地址归一到其 /48 网络地址
+            net48 = ipaddress.ip_network(f"{s}/48", strict=False)
+        except Exception:
+            continue
+        if net48 not in seen48:
+            seen48.add(net48)
+            tgt48.append(net48)
+    if not tgt48:
+        return []
+    tasks = []
+    for net48 in tgt48:
+        for x in range(0, 256):
+            tasks.append((x, net48))
+
+    def probe(item):
+        x, net48 = item
+        # 在 /48 内枚举 256 个不同的 /64 子网：/64 索引位于第 4 段（bits 48-63）
+        addr = ipaddress.IPv6Address(int(net48.network_address) + (x << 48))
+        return net48, x, _tcp_open_v6(addr, 443, timeout)
+
+    live = []
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(tasks)))) as ex:
+            for net48, x, ok in ex.map(probe, tasks):
+                if ok:
+                    addr64 = ipaddress.IPv6Address(int(net48.network_address) + (x << 48))
+                    # strict=False 掩掉接口ID，得到对齐的 /64 网络地址
+                    live.append(ipaddress.ip_network(f"{addr64}/64", strict=False))
+    except Exception:
+        pass
+    return live
+
+
+def generate_ipv6_candidates():
+    """发现可达的 Cloudflare IPv6 /64 前缀，并在其中随机变换接口ID采样，
+    返回 [ipv6]:port#IPV6 节点列表。只采样确认可达的前缀，避免整段 /32 随机
+    抽不到（CF 仅在特定已宣告前缀响应）。"""
+    count = int(IPV6_SAMPLE_COUNT)
+    port = int(IPV6_PORT)
+    placeholder = IPV6_PLACEHOLDER_COUNTRY
+    if count <= 0:
+        return []
+    seeds = _discover_ipv6_seeds()
+    if not seeds:
+        return []
+    live64 = _discover_live_prefixes(seeds)
+    if not live64:
+        # 退化：直接用种子所在 /64 采样
+        for s in seeds:
+            try:
+                live64.append(ipaddress.ip_network(f"{s}/64", strict=False))
+            except Exception:
+                pass
+    if not live64:
+        return []
+    random.shuffle(live64)
+    per = max(1, count // len(live64))
+    nodes = []
+    seen = set()
+    for net64 in live64:
+        base = int(net64.network_address)
+        got = 0
+        attempts = 0
+        while got < per and attempts < per * 4:
+            attempts += 1
+            addr = ipaddress.IPv6Address(base + random.getrandbits(64))
+            node = "[%s]:%d#%s" % (addr, port, placeholder)
+            if node not in seen:
+                seen.add(node)
+                nodes.append(node)
+                got += 1
+    return nodes
+
+
+def _is_ipv6_node(node_str):
+    return node_str.startswith("[")
+
+
+def _node_port(node_str):
+    """返回节点端口（兼容 IPv4 / IPv6），解析失败返回 None。"""
+    if node_str.startswith("["):
+        m = re.match(r"^\[[0-9A-Fa-f:]+\]:(\d+)", node_str)
+    else:
+        m = re.match(r"^\d+\.\d+\.\d+\.\d+:(\d+)", node_str)
+    return m.group(1) if m else None
+
+
+def _ensure_ipv6_representation(final_selected, v6_pool):
+    """保证合并输出的 ip.txt 中始终含至少 IPV6_MIN_IN_OUTPUT 个 IPv6 节点。
+
+    v6_pool: IPv6 候选池，元素为 (node, score)。优先用带带宽得分的节点；
+    若带宽探测失败导致 scored_nodes 为空，则退回「已通过 TCP + HTTP /cdn-cgi/trace
+    校验」的 IPv6 节点（已确属真实 Cloudflare 边缘），保证不丢 IPv6。
+    若数量仍不足，用得分最高的 IPv6 顶替得分最低的 IPv4，腾出名额。"""
+    min_v6 = int(IPV6_MIN_IN_OUTPUT)
+    if min_v6 <= 0:
+        return final_selected
+    v6_in = [n for n in final_selected if _is_ipv6_node(n)]
+    if len(v6_in) >= min_v6:
+        return final_selected
+    # 同一节点取最高得分（带宽得分 > HTTP 校验保底分）
+    best = {}
+    for n, s in v6_pool:
+        if _is_ipv6_node(n) and (n not in best or s > best[n]):
+            best[n] = s
+    pool = sorted(best.items(), key=lambda x: x[1], reverse=True)
+    selected = set(final_selected)
+    pool = [it for it in pool if it[0] not in selected]
+    need = min_v6 - len(v6_in)
+    if not pool:
+        return final_selected
+    removable = sorted([n for n in final_selected if not _is_ipv6_node(n)],
+                       key=lambda n: best.get(n, 0.0))
+    result = list(final_selected)
+    added = 0
+    for node, _ in pool:
+        if added >= need:
+            break
+        if removable:
+            result.remove(removable.pop(0))
+        result.append(node)
+        added += 1
+    return result
+
+
+# ----------------------------------------------------------------------------
+# IPv6 地区解析（仅用于展示）：免费、无 token 的 GeoIP API，带本地缓存。
+# 在「全部过滤 + 稳定性筛选」之后才解析，因此不会因真实地区命中黑名单而误删
+# IPv6 节点（保活优先）；解析失败或缺网则回退占位 "IPV6"。
+# ----------------------------------------------------------------------------
+_IPV6_GEO_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "ipv6_geo_cache.json")
+
+
+def _load_ipv6_geo_cache():
+    try:
+        with open(_IPV6_GEO_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_ipv6_geo_cache(cache):
+    try:
+        with open(_IPV6_GEO_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _geo_lookup(ip):
+    """免费无 key 的 GeoIP 查询，返回两位大写国家码或空串。"""
+    apis = [
+        f"https://ipwho.is/{ip}",
+        f"https://ipapi.co/{ip}/json/",
+    ]
+    for url in apis:
+        try:
+            r = requests.get(
+                url, timeout=4, verify=False,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; cf-ip-stable/1.0)"})
+            if r.status_code != 200:
+                continue
+            d = r.json()
+            cc = (d.get("country_code") or d.get("countryCode") or "").upper()
+            if len(cc) == 2 and cc.isalpha():
+                return cc
+        except Exception:
+            continue
+    return ""
+
+
+def resolve_ipv6_countries(nodes):
+    """为最终输出的 IPv6 节点解析真实国家，返回 {node: 'XX'}（失败保留 'IPV6'）。"""
+    cache = _load_ipv6_geo_cache()  # {ip: cc}
+    result = {}
+    changed = False
+    for n in nodes:
+        if not _is_ipv6_node(n):
+            continue
+        ip = n.split(']:')[0].lstrip('[')
+        cc = cache.get(ip)
+        if not cc:
+            cc = _geo_lookup(ip) or "IPV6"
+            if cc != "IPV6":
+                cache[ip] = cc
+                changed = True
+        result[n] = cc
+    if changed:
+        _save_ipv6_geo_cache(cache)
+    return result
+
 
 # ==================== 国家代码映射表（全球覆盖）====================
 CN_TO_CODE = {
@@ -311,6 +564,17 @@ def load_config():
         "STABILITY_CONFIRM_RUNS": 2,
         "STABILITY_MAX_ABSENT_RUNS": 3,
         "STABILITY_MIN_CONSISTENCY": 0.55,
+        # ===== IPv6 支持（合并进 ip.txt）=====
+        "IPV6_ENABLED": True,
+        "IPV6_SEED_HOSTS": ["speed.cloudflare.com", "www.cloudflare.com", "cloudflare.com"],
+        "IPV6_FALLBACK_SEEDS": ["2400:cb00:2049:1::a29f:2020", "2606:4700:4700::1111"],
+        "IPV6_SCAN_TIMEOUT": 1.0,
+        "IPV6_SCAN_WORKERS": 256,
+        "IPV6_SAMPLE_COUNT": 300,
+        "IPV6_PORT": 443,
+        "IPV6_PLACEHOLDER_COUNTRY": "IPV6",
+        "IPV6_CANDIDATE_RESERVE": 30,
+        "IPV6_MIN_IN_OUTPUT": 5,
     }
 
     try:
@@ -446,6 +710,17 @@ STABILITY_HYSTERESIS_RATIO = cfg["STABILITY_HYSTERESIS_RATIO"]
 STABILITY_CONFIRM_RUNS = cfg["STABILITY_CONFIRM_RUNS"]
 STABILITY_MAX_ABSENT_RUNS = cfg["STABILITY_MAX_ABSENT_RUNS"]
 STABILITY_MIN_CONSISTENCY = cfg["STABILITY_MIN_CONSISTENCY"]
+# IPv6 支持（合并进 ip.txt）
+IPV6_ENABLED = cfg["IPV6_ENABLED"]
+IPV6_SEED_HOSTS = cfg["IPV6_SEED_HOSTS"]
+IPV6_FALLBACK_SEEDS = cfg["IPV6_FALLBACK_SEEDS"]
+IPV6_SCAN_TIMEOUT = cfg["IPV6_SCAN_TIMEOUT"]
+IPV6_SCAN_WORKERS = cfg["IPV6_SCAN_WORKERS"]
+IPV6_SAMPLE_COUNT = cfg["IPV6_SAMPLE_COUNT"]
+IPV6_PORT = cfg["IPV6_PORT"]
+IPV6_PLACEHOLDER_COUNTRY = cfg["IPV6_PLACEHOLDER_COUNTRY"]
+IPV6_CANDIDATE_RESERVE = cfg["IPV6_CANDIDATE_RESERVE"]
+IPV6_MIN_IN_OUTPUT = cfg["IPV6_MIN_IN_OUTPUT"]
 
 # 记录本次运行中发生硬降级的环节（该层完全失效、退化为上一层的原始结果）。
 # 只要出现过降级，写 ip.txt 时就要求产出不低于上次，否则保留旧结果。
@@ -1101,14 +1376,17 @@ def calibrate_regions(nodes, token_file, cache_file):
 # =========================== 核心测试、筛选、测速及更新函数 ===========================
 
 def test_tcp_latency(ip, port, timeout=TIMEOUT, probes=TCP_PROBES):
+    is_v6 = ip.startswith("[")
+    family = socket.AF_INET6 if is_v6 else socket.AF_INET
+    host = ip[1:-1] if is_v6 else ip
     max_latency = 0.0
     success = 0
     for _ in range(probes):
         try:
             start = time.time()
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
                 sock.settimeout(timeout)
-                sock.connect((ip, int(port)))
+                sock.connect((host, int(port)))
             latency = time.time() - start
             if latency > max_latency:
                 max_latency = latency
@@ -1130,6 +1408,10 @@ def test_node(node_str):
     return (node_str, max_lat, country, success)
 
 def check_availability(node_str):
+    # IPv6 节点走的是 Cloudflare 原生 IPv6 边缘，外置可用性 API 仅校验 IPv4 代理，
+    # 对 IPv6 直接放行；是否真为可用 CF 节点由后续的 HTTP /cdn-cgi/trace 检测把关。
+    if _is_ipv6_node(node_str):
+        return (node_str, True, "ipv6-bypass", {})
     m = IP_PORT_PATTERN.match(node_str)
     if not m:
         return (node_str, False, "unknown", {})
@@ -1787,7 +2069,8 @@ def sync_to_github():
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 creationflags=creationflags
             )
 
@@ -1866,21 +2149,28 @@ def write_ip_txt(final_nodes, output_file,
                  footer_enabled, footer_lines,
                  perline_enabled, perline_text,
                  speed_map=None, latency_map=None,
-                 http_latency_map=None, http_jitter_map=None):
+                 http_latency_map=None, http_jitter_map=None,
+                 display_overrides=None):
+    display_overrides = display_overrides or {}
     with open(output_file, "w", encoding="utf-8") as f:
         if header_enabled:
             for line in header_lines:
                 f.write(line + "\n")
         for node in final_nodes:
-            line = node
-            if IP_TXT_SHOW_BANDWIDTH and speed_map and node in speed_map:
-                line += f" {speed_map[node]:.2f} Mbps"
-            if IP_TXT_SHOW_HTTP_LATENCY and http_latency_map and node in http_latency_map:
-                line += f" {http_latency_map[node]:.2f} ms"
-            if IP_TXT_SHOW_HTTP_JITTER and http_jitter_map and node in http_jitter_map:
-                line += f" {http_jitter_map[node]:.2f} ms"
+            # 展示用节点（IPv6 已替换为真实地区），但指标查询用原始节点
+            out_node = display_overrides.get(node, node)
+            extras = []
             if IP_TXT_SHOW_LATENCY and latency_map and node in latency_map:
-                line += f" {latency_map[node]*1000:.2f} ms"
+                extras.append(f"{latency_map[node]*1000:.0f}ms")
+            if IP_TXT_SHOW_HTTP_LATENCY and http_latency_map and node in http_latency_map:
+                extras.append(f"{http_latency_map[node]:.0f}ms")
+            if IP_TXT_SHOW_BANDWIDTH and speed_map and node in speed_map:
+                extras.append(f"{speed_map[node]:.2f}Mbps")
+            if IP_TXT_SHOW_HTTP_JITTER and http_jitter_map and node in http_jitter_map:
+                extras.append(f"{http_jitter_map[node]:.0f}ms")
+            line = out_node
+            if extras:
+                line += " " + " ".join(extras)
             if perline_enabled and perline_text:
                 line += perline_text
             f.write(line + "\n")
@@ -1921,13 +2211,19 @@ def main():
     RUN_STATS["数据源合并"] = len(nodes)
     print(f"合并后总计 {len(nodes)} 个节点。")
 
+    if IPV6_ENABLED:
+        v6 = generate_ipv6_candidates()
+        if v6:
+            nodes.extend(v6)
+            print(f"已注入 {len(v6)} 个 IPv6 候选节点（Cloudflare IPv6 段随机采样）。")
+
     token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), IP_CALIBRATION_TOKEN_FILE)
     cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), IP_CALIBRATION_CACHE_FILE)
     calibrate_regions(nodes, token_file, cache_file)
 
     if PRE_FILTER_PORT_ENABLED:
         before = len(nodes)
-        nodes = [n for n in nodes if n.split(':')[1].split('#')[0] in PRE_FILTER_PORTS]
+        nodes = [n for n in nodes if _node_port(n) in PRE_FILTER_PORTS]
         after = len(nodes)
         ports_display = ', '.join(PRE_FILTER_PORTS)
         print(f"前置端口过滤（仅保留端口 {ports_display}）：{before} -> {after} 个节点")
@@ -1992,8 +2288,15 @@ def main():
     latency_map = {node: lat for node, lat, _, _ in results}
 
     if USE_GLOBAL_MODE:
-        candidates = [node for node, _, _, _ in results[:BANDWIDTH_CANDIDATES]]
-        print(f"\nTCP 最优前 {len(candidates)} 个节点进入候选池。")
+        ipv4_results = [r for r in results if not _is_ipv6_node(r[0])]
+        ipv6_results = [r for r in results if _is_ipv6_node(r[0])]
+        reserve = int(IPV6_CANDIDATE_RESERVE)
+        reserve = min(reserve, len(ipv6_results))
+        ipv4_take = max(0, BANDWIDTH_CANDIDATES - reserve)
+        candidates = [n for n, _, _, _ in ipv4_results[:ipv4_take]]
+        candidates += [n for n, _, _, _ in ipv6_results[:reserve]]
+        print(f"\nTCP 最优前 {len(candidates)} 个节点进入候选池"
+              f"（其中 IPv6 预留 {reserve} 个）。")
     else:
         country_nodes = defaultdict(list)
         for node_str, lat, country, succ in results:
@@ -2088,20 +2391,31 @@ def main():
             score_dict = {item[0]: item[1] for item in scored_nodes}
             final_selected.sort(key=lambda n: score_dict.get(n, 0), reverse=True)
 
-        print("\n================ 最终优选节点 ================")
-        for i, node in enumerate(final_selected, 1):
-            speed = speed_map.get(node, 0)
-            tcp_lat = latency_map.get(node, float('inf'))
-            http_lat = http_latency_map.get(node, None)
-            http_jitter = http_jitter_map.get(node, None)
-            line = f"{i}. {node} 速度 {speed:.2f} Mbps"
-            if http_lat is not None:
-                line += f" 延迟 {http_lat:.2f} ms"
-            if http_jitter is not None:
-                line += f" 抖动 {http_jitter:.2f} ms"
-            if tcp_lat != float('inf'):
-                line += f" 延迟 {tcp_lat*1000:.2f} ms"
-            print(line)
+    # IPv6 保底：保证合并输出中始终含一定数量的 IPv6 节点
+    # 候选池优先取带带宽得分的 scored_nodes，退回已由 HTTP /cdn-cgi/trace 校验的 IPv6
+    _v6_pool = []
+    if 'scored_nodes' in locals():
+        _v6_pool += [(n, s) for n, s, *_ in scored_nodes]
+    _v6_pool += [(n, 0.0) for n in candidates_after_http if _is_ipv6_node(n)]
+    final_selected = _ensure_ipv6_representation(final_selected, _v6_pool)
+
+    # IPv6 节点解析真实地区（仅展示用，放在全部筛选之后，不影响保活/过滤）
+    _ipv6_geo = resolve_ipv6_countries(final_selected)
+    display_overrides = {
+        n: n.replace("#IPV6", "#" + _ipv6_geo.get(n, "IPV6"))
+        for n in final_selected if _is_ipv6_node(n)
+    }
+
+    print("\n================ 最终优选节点 ================")
+    for i, node in enumerate(final_selected, 1):
+        disp = display_overrides.get(node, node)
+        speed = speed_map.get(node, 0)
+        tcp_lat = latency_map.get(node)
+        if tcp_lat is not None:
+            line = f"{i}. {disp} {tcp_lat*1000:.0f}ms {speed:.2f}Mbps"
+        else:
+            line = f"{i}. {disp} {speed:.2f}Mbps"
+        print(line)
 
     # ============ 最小产出保护 ============
     # 产出明显低于历史水平时，保留旧 ip.txt、不更新 DNS、不推送 GitHub。
@@ -2127,7 +2441,8 @@ def main():
                  speed_map=speed_map,
                  latency_map=latency_map,
                  http_latency_map=http_latency_map,
-                 http_jitter_map=http_jitter_map)
+                 http_jitter_map=http_jitter_map,
+                 display_overrides=display_overrides)
     print(f"\n结果已保存到 {OUTPUT_FILE}（共 {len(final_selected)} 个节点）")
 
     ip_list = [node.split(':')[0] for node in final_selected]
