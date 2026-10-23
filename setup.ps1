@@ -133,15 +133,13 @@ if ($pythonCmd) {
     Write-Host "✅ Python 安装完成: $PythonExePath" -ForegroundColor Green
 }
 
-# ---------- 2. 检测/安装 Git ----------
-Write-Host "[2/4] 检查 Git..." -ForegroundColor Green
+# ---------- 2. 检测 Git（可选，推送走 REST API 不需要 git）----------
+Write-Host "[2/4] 检查 Git（可选，推送走 GitHub REST API，不需要 git）..." -ForegroundColor Green
 $gitCmd = Get-Command git -ErrorAction SilentlyContinue
 if ($gitCmd) {
     Write-Host "✅ Git 已安装: $($gitCmd.Source)" -ForegroundColor Gray
 } else {
-    Write-Host "未检测到 Git，正在通过 winget 安装 Git..." -ForegroundColor Yellow
-    winget install Git.Git --accept-package-agreements --accept-source-agreements
-    Write-Host "✅ Git 安装完成。" -ForegroundColor Green
+    Write-Host "ℹ️ 未检测到 Git —— 不影响使用（推送脚本用 GitHub REST API，无需 git 命令）。" -ForegroundColor Yellow
 }
 
 # ---------- 3. 检测/安装 curl ----------
@@ -231,6 +229,37 @@ if (-not (Test-Path $PythonScriptPath)) {
     Write-Host "   预期位置: $PythonScriptPath" -ForegroundColor Yellow
     Read-Host "按 Enter 键退出"
     exit 1
+}
+
+# ---------- 自动生成 config.json（从模板复制）----------
+$ConfigPath = Join-Path $ScriptDir "config.json"
+$ConfigExample = Join-Path $ScriptDir "config.json.example"
+if (Test-Path $ConfigPath) {
+    Write-Host "ℹ️ config.json 已存在，保留不动。" -ForegroundColor Gray
+} elseif (Test-Path $ConfigExample) {
+    Copy-Item $ConfigExample $ConfigPath -Force
+    Write-Host "✅ 已从 config.json.example 生成 config.json（请填入 WxPusher 密钥）" -ForegroundColor Green
+} else {
+    Write-Host "⚠️ 未找到 config.json.example，请手动创建 config.json。" -ForegroundColor Yellow
+}
+
+# ---------- 自动生成 git_sync.ps1（从模板复制）----------
+$SyncPs1Path = Join-Path $ScriptDir "git_sync.ps1"
+$SyncPs1Example = Join-Path $ScriptDir "git_sync.ps1.example"
+if (Test-Path $SyncPs1Path) {
+    Write-Host "ℹ️ git_sync.ps1 已存在，保留不动。" -ForegroundColor Gray
+} elseif (Test-Path $SyncPs1Example) {
+    Copy-Item $SyncPs1Example $SyncPs1Path -Force
+    Write-Host "✅ 已从 git_sync.ps1.example 生成 git_sync.ps1（请填入 GitHub Token）" -ForegroundColor Green
+} else {
+    Write-Host "⚠️ 未找到 git_sync.ps1.example，请手动创建 git_sync.ps1。" -ForegroundColor Yellow
+}
+
+# ---------- valid_tokens.txt（ipinfo 地区校准用，可选）----------
+$TokensPath = Join-Path $ScriptDir "valid_tokens.txt"
+if (-not (Test-Path $TokensPath)) {
+    New-Item -ItemType File -Path $TokensPath -Force | Out-Null
+    Write-Host "ℹ️ 已创建空的 valid_tokens.txt（可填 ipinfo.io token；留空则跳过地区校准，不影响主流程）" -ForegroundColor Gray
 }
 
 # ========== 创建计划任务（优先 COM 对象，失败后回退 schtasks） ==========
@@ -328,6 +357,7 @@ Write-Host ""
 Write-Host "👉 接下来请完成以下手动配置步骤：" -ForegroundColor White
 Write-Host "1. 编辑 config.json，填写 WxPusher 的 APP_TOKEN 和 UID（如需通知）" -ForegroundColor White
 Write-Host "2. 编辑 git_sync.ps1，填写你的 GitHub Token、用户名及仓库名" -ForegroundColor White
+Write-Host "   （Token 在 https://github.com/settings/tokens 生成，勾选 repo 权限）" -ForegroundColor DarkGray
 Write-Host "3. 可选：在'任务计划程序' (taskschd.msc) 中查看或调整任务" -ForegroundColor Gray
 Write-Host "4. 手动运行一次测试：python main.py（或等待计划任务自动执行）" -ForegroundColor Green
 Write-Host ""
