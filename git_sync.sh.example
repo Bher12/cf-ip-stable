@@ -1,24 +1,150 @@
 #!/usr/bin/env bash
 # ============================================================
 # cf-ip-stable 推送脚本（Linux）
-# 用法：复制本文件为 git_sync.sh，填入下方四个变量，main.py 会自动调用。
+#
+# 基于 GitHub REST API 实现，**无需安装 git**。
+# 用法：复制本文件为 git_sync.sh，填入下方三个变量，main.py 会自动调用。
+#
+# 若你的电脑已装 git 且想用 git 方式推送，可参考本文件末尾的 git 版写法。
 # ============================================================
-github_token="your_github_personal_access_token_here"
+# Token 也可通过环境变量 GITHUB_TOKEN 注入（优先级高于下方默认值）
+github_token="${GITHUB_TOKEN:-your_github_token_here}"
 github_username="your_github_username"
 repo_name="your_repo_name"
 branch="main"
 
+ip_remote_name="ip.txt"
+summary_remote_name="run_summary.json"
+state_remote_name="stability_state.json"
+
 cd "$(dirname "$0")" || exit 1
 
-# 仅提交需要对外订阅 / 持久化的产物
-#（stability_state.json 记录跨运行历史，提交后可在换机/重部署时保留稳定性记忆）
-git add -f ip.txt stability_state.json run_summary.json
-if git diff --cached --quiet; then
-    echo "没有需要提交的变更，跳过推送。"
+API="https://api.github.com"
+
+# ---------- 校验配置 ----------
+# 占位符判定必须与 github_token 的默认值字符串完全一致，
+# 否则带占位符去请求只会得到 401 Bad credentials，而不是友好提示。
+if [[ "$github_token" == "your_github_token_here" ]] || \
+   [[ "$github_token" == "your_github_personal_access_token_here" ]] || \
+   [[ -z "$github_token" ]] || \
+   [[ "$github_username" == "your_github_username" ]] || \
+   [[ "$repo_name" == "your_repo_name" ]]; then
+    echo "❌ git_sync.sh 未配置，跳过 GitHub 同步。"
+    echo "   提示：设置环境变量 GITHUB_TOKEN，或修改本文件顶部变量。"
     exit 0
 fi
-git commit -q -m "update: $(date '+%Y-%m-%d %H:%M:%S')"
 
-remote_url="https://${github_token}@github.com/${github_username}/${repo_name}.git"
-git push "${remote_url}" "HEAD:${branch}" --force
-echo "✅ ip.txt 已推送到 GitHub（独立仓库）"
+repo_api="${API}/repos/${github_username}/${repo_name}"
+export REPO_API="$repo_api"
+export GITHUB_TOKEN="$github_token"
+
+# ---------- 确保仓库存在（不存在则创建，私有）----------
+if ! curl -s -o /dev/null -w '%{http_code}' -H "Authorization: token ${github_token}" \
+        "${repo_api}" | grep -q '^200$'; then
+    echo "仓库 ${github_username}/${repo_name} 不存在，尝试创建..."
+    curl -s -X POST -H "Authorization: token ${github_token}" \
+        -d "{\"name\":\"${repo_name}\",\"private\":true,\"description\":\"Cloudflare IP 优选结果自动同步\"}" \
+        "${API}/user/repos" | head -c 300
+    echo ""
+    sleep 2
+fi
+
+# ---------- 上传单个文件 ----------
+# upload <本地文件> <远端文件名>
+upload() {
+    local file="$1"
+    local remote_name="${2:-$1}"
+    [[ -f "$file" ]] || { echo "跳过（文件不存在）: $file"; return 0; }
+
+    local payload_file="/tmp/gh_payload_$$.json"
+    python3 - "$file" "$remote_name" "$branch" "$payload_file" <<'PY'
+import sys, json, base64, os, urllib.request
+
+local_file, remote_name, branch, out_file = sys.argv[1:5]
+
+repo_api = os.environ["REPO_API"]
+token = os.environ["GITHUB_TOKEN"]
+
+with open(local_file, "rb") as f:
+    content = base64.b64encode(f.read()).decode("ascii")
+
+sha = ""
+try:
+    req = urllib.request.Request(
+        f"{repo_api}/contents/{remote_name}?ref={branch}",
+        headers={"Authorization": f"token {token}",
+                 "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        sha = json.load(r).get("sha", "") or ""
+except Exception:
+    sha = ""
+
+payload = {
+    "message": "update: " + __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "content": content,
+    "branch": branch,
+}
+if sha:
+    payload["sha"] = sha
+
+with open(out_file, "w") as f:
+    json.dump(payload, f)
+print("sha_found" if sha else "sha_new")
+PY
+
+    local code attempt=1 max_attempts=3
+    while [[ $attempt -le $max_attempts ]]; do
+        code=$(curl -s -o /tmp/git_sync_resp.json -w '%{http_code}' -X PUT \
+            -H "Authorization: token ${github_token}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data-binary "@${payload_file}" \
+            "${repo_api}/contents/${remote_name}")
+
+        if [[ "$code" == "200" || "$code" == "201" ]]; then
+            echo "✅ 已推送: ${remote_name}"
+            rm -f "$payload_file"
+            return 0
+        fi
+
+        echo "⚠️ 推送失败 (${remote_name}, HTTP ${code}), 第 ${attempt}/${max_attempts} 次尝试..."
+        head -c 200 /tmp/git_sync_resp.json
+        echo ""
+        attempt=$((attempt + 1))
+        if [[ $attempt -le $max_attempts ]]; then
+            sleep 10
+        fi
+    done
+
+    rm -f "$payload_file"
+    echo "❌ 推送失败 (${remote_name}): 已重试 ${max_attempts} 次仍不成功"
+    return 1
+}
+
+# ---------- 推送订阅产物 ----------
+# ip.txt 是客户端订阅的核心文件；run_summary.json / stability_state.json 用于留档与跨机稳定性记忆
+sync_failed=0
+upload "ip.txt"            "$ip_remote_name"            || sync_failed=1
+upload "run_summary.json"  "$summary_remote_name"      || sync_failed=1
+upload "stability_state.json" "$state_remote_name"     || sync_failed=1
+
+if [[ "$sync_failed" != "0" ]]; then
+    echo "❌ GitHub 同步失败：部分文件未上传（详见上方 HTTP 状态码）"
+    exit 1
+fi
+
+echo "✅ GitHub 同步完成"
+echo "   订阅链接: https://raw.githubusercontent.com/${github_username}/${repo_name}/refs/heads/${branch}/${ip_remote_name}"
+
+# ============================================================
+# 备选方案：已装 git 时可用下面的 git 方式推送（更简单，但需要 git 命令）
+# ============================================================
+# git add -f ip.txt stability_state.json run_summary.json
+# if git diff --cached --quiet; then
+#     echo "没有需要提交的变更，跳过推送。"
+#     exit 0
+# fi
+# git commit -q -m "update: $(date '+%Y-%m-%d %H:%M:%S')"
+# remote_url="https://${github_token}@github.com/${github_username}/${repo_name}.git"
+# git push "${remote_url}" "HEAD:${branch}" --force
+# echo "✅ ip.txt 已推送到 GitHub（独立仓库）"
