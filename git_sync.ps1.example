@@ -1,24 +1,108 @@
 # ============================================================
-# cf-ip-stable 推送脚本（Windows）
-# 用法：复制本文件为 git_sync.ps1，填入下方四个变量，main.py 会自动调用。
+# cf-ip-stable 推送脚本（Windows / PowerShell）
+#
+# 基于 GitHub REST API 实现，**无需安装 git**。
+# 用法：复制本文件为 git_sync.ps1，填入下方三个变量，main.py 会自动调用。
+#
+# 若你的电脑已装 git 且想用 git 方式推送，可参考 git_sync.sh.example。
 # ============================================================
-$github_token = "your_github_personal_access_token_here"
+# Token 也可通过环境变量 GITHUB_TOKEN 注入（优先级高于下方默认值）
+$github_token    = if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { "your_github_token_here" }
 $github_username = "your_github_username"
-$repo_name = "your_repo_name"
-$branch = "main"
+$repo_name       = "your_repo_name"
+$branch          = "main"
 
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-Set-Location $scriptDir
+$ip_remote_name      = "ip.txt"
+$summary_remote_name = "run_summary.json"
+$state_remote_name   = "stability_state.json"
 
-# 仅提交需要对外订阅 / 持久化的产物
-git add -f ip.txt stability_state.json run_summary.json
-$changes = git diff --cached --name-only
-if (-not $changes) {
-    Write-Host "没有需要提交的变更，跳过推送。"
+Set-Location -Path (Split-Path -Parent $MyInvocation.MyCommand.Definition)
+
+$API = "https://api.github.com"
+
+if ($github_token -eq "your_github_token_here" -or
+    $github_token -eq "your_github_personal_access_token_here" -or
+    [string]::IsNullOrWhiteSpace($github_token) -or
+    $github_username -eq "your_github_username" -or
+    $repo_name -eq "your_repo_name") {
+    Write-Host "❌ git_sync.ps1 未配置，跳过 GitHub 同步。" -ForegroundColor Red
+    Write-Host "   提示：设置环境变量 GITHUB_TOKEN，或修改本文件顶部变量。" -ForegroundColor Yellow
     exit 0
 }
-git commit -q -m "update: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 
-$remoteUrl = "https://$($github_token)@github.com/$($github_username)/$($repo_name).git"
-git push $remoteUrl "HEAD:$($branch)" --force
-Write-Host "✅ ip.txt 已推送到 GitHub（独立仓库）"
+$headers = @{
+    "Authorization" = "token $github_token"
+    "Accept"        = "application/vnd.github+json"
+    "User-Agent"    = "cf-ip-stable-sync"
+}
+
+$repo_api = "$API/repos/$github_username/$repo_name"
+
+# 确保仓库存在
+try {
+    $null = Invoke-RestMethod -Uri $repo_api -Headers $headers -Method Get -TimeoutSec 30
+} catch {
+    Write-Host "仓库不存在，尝试创建..." -ForegroundColor Yellow
+    try {
+        $body = @{ name = $repo_name; private = $true; description = "Cloudflare IP 优选结果自动同步" } | ConvertTo-Json
+        $null = Invoke-RestMethod -Uri "$API/user/repos" -Headers $headers -Method Post -Body $body -ContentType "application/json" -TimeoutSec 30
+        Start-Sleep -Seconds 2
+    } catch {
+        Write-Host "❌ 仓库创建失败: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+function Upload-File {
+    param([string]$File, [string]$RemoteName)
+    if (-not (Test-Path -LiteralPath $File)) {
+        Write-Host "跳过（文件不存在）: $File" -ForegroundColor DarkGray
+        return $true
+    }
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $File))
+    $content = [Convert]::ToBase64String($bytes)
+
+    $sha = ""
+    try {
+        $existing = Invoke-RestMethod -Uri "$repo_api/contents/$RemoteName`?ref=$branch" -Headers $headers -Method Get -TimeoutSec 30
+        if ($existing -and $existing.sha) { $sha = $existing.sha }
+    } catch { $sha = "" }
+
+    $payload = @{
+        message = "update: " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        content = $content
+        branch  = $branch
+    }
+    if ($sha) { $payload["sha"] = $sha }
+    $json = $payload | ConvertTo-Json -Depth 5 -Compress
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $resp = Invoke-WebRequest -Uri "$repo_api/contents/$RemoteName" -Headers $headers `
+                -Method Put -Body ([System.Text.Encoding]::UTF8.GetBytes($json)) `
+                -ContentType "application/json" -TimeoutSec 60 -UseBasicParsing
+            if ($resp.StatusCode -eq 200 -or $resp.StatusCode -eq 201) {
+                Write-Host "✅ 已推送: $RemoteName" -ForegroundColor Green
+                return $true
+            }
+        } catch {
+            Write-Host "⚠️ 推送失败 ($RemoteName), 第 $attempt/3 次尝试..." -ForegroundColor Yellow
+        }
+        if ($attempt -lt 3) { Start-Sleep -Seconds 10 }
+    }
+    Write-Host "❌ 推送失败 ($RemoteName): 已重试 3 次仍不成功" -ForegroundColor Red
+    return $false
+}
+
+$syncFailed = 0
+if (-not (Upload-File -File "ip.txt"               -RemoteName $ip_remote_name))      { $syncFailed = 1 }
+if (-not (Upload-File -File "run_summary.json"     -RemoteName $summary_remote_name)) { $syncFailed = 1 }
+if (-not (Upload-File -File "stability_state.json" -RemoteName $state_remote_name))   { $syncFailed = 1 }
+
+if ($syncFailed -ne 0) {
+    Write-Host "❌ GitHub 同步失败" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "✅ GitHub 同步完成" -ForegroundColor Green
+Write-Host "   订阅链接: https://raw.githubusercontent.com/$github_username/$repo_name/refs/heads/$branch/$ip_remote_name"
+exit 0
