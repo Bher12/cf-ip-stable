@@ -3,6 +3,9 @@
 这是 [Tll-ll/cf-ip](https://github.com/Tll-ll/cf-ip) 的一个 **fork / 改进版**，专为「选出来的 IP 不够稳、不持久」而做。
 它与你正在用的原版**完全独立**：独立文件夹、独立 git 远程、独立 GitHub 仓库、独立订阅链接，可与原版**并行运行、互不干扰**。
 
+> **换电脑 / 新机器部署 → 看 [`DEPLOY_NEW_MACHINE.md`](DEPLOY_NEW_MACHINE.md)**
+> 包含 Linux 与 Windows 各自的完整步骤、依赖安装、密钥清单与常见问题排查。
+
 ---
 
 ## 改了什么（核心：测频繁，发谨慎）
