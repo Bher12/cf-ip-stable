@@ -1,0 +1,79 @@
+{
+  "_说明": "完整配置模板。复制本文件为 config.json 后按需修改即可（缺省项会用程序内置默认值）。",
+  "_安全": "config.json 含真实凭证，已被 .gitignore 忽略，请勿提交到公开仓库。",
+  "_换机提示": "换电脑时只需复制本文件并填入密钥；其余默认值已内置，无需逐项填写。",
+
+  "USE_GLOBAL_MODE": true,
+  "GLOBAL_TOP_N": 15,
+  "PER_COUNTRY_TOP_N": 1,
+  "BANDWIDTH_CANDIDATES": 150,
+  "BANDWIDTH_WORKERS": 8,
+  "BANDWIDTH_TIMEOUT": 10,
+  "BANDWIDTH_SIZE_MB": 2.0,
+  "BANDWIDTH_MIN_SPEED_MBPS": 10.0,
+  "BANDWIDTH_MIN_SPEED_MBPS_IPV6": 5.0,
+  "TIMEOUT": 2.0,
+  "MAX_WORKERS": 300,
+
+  "PRE_FILTER_PORT_ENABLED": false,
+  "PRE_FILTER_PORTS": [443],
+  "PRE_FILTER_BLOCKED_ENABLED": true,
+  "PRE_FILTER_BLOCKED_COUNTRIES": ["CN"],
+
+  "FILTER_COUNTRIES_ENABLED": false,
+  "ALLOWED_COUNTRIES": ["US"],
+
+  "TEST_AVAILABILITY": true,
+  "HTTP_TEST_ENABLED": true,
+
+  "IPV6_ENABLED": true,
+  "IPV6_SEED_HOSTS": ["speed.cloudflare.com", "www.cloudflare.com", "cloudflare.com"],
+  "IPV6_PREFIX_ALLOWLIST": ["2a06:98c1:58"],
+  "IPV6_MIN_IN_OUTPUT": 5,
+  "IPV4_MIN_IN_OUTPUT": 10,
+
+  "STABILITY_ENABLED": true,
+  "STABILITY_STATE_FILE": "stability_state.json",
+  "STABILITY_EMA_ALPHA": 0.35,
+  "STABILITY_RECENT_N": 8,
+  "STABILITY_MIN_SAMPLES": 2,
+  "STABILITY_HISTORY_WEIGHT": 0.6,
+  "STABILITY_HYSTERESIS_RATIO": 0.15,
+  "STABILITY_CONFIRM_RUNS": 2,
+  "STABILITY_MAX_ABSENT_RUNS": 3,
+  "STABILITY_MIN_CONSISTENCY": 0.55,
+  "STABILITY_PRUNE_ABSENT": 30,
+
+  "OUTPUT_GUARD_RATIO": 0.3,
+  "OUTPUT_MIN_NODES": 5,
+
+  "IP_CALIBRATION_ENABLED": true,
+  "IP_CALIBRATION_TOKEN_FILE": "valid_tokens.txt",
+  "IP_CALIBRATION_CACHE_FILE": "ipinfo_cache.txt",
+  "IP_CALIBRATION_CONCURRENCY": 300,
+  "IP_CALIBRATION_MIN_INTERVAL": 0.1,
+
+  "ENABLE_WXPUSHER": true,
+  "_wxpusher_说明": "以下两项填 WxPusher 后台拿到的 APP_TOKEN 与 UID；不需要推送通知则把 ENABLE_WXPUSHER 设为 false",
+  "WXPUSHER_APP_TOKEN": "AT_xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "WXPUSHER_UIDS": ["UID_xxxxxxxxxxxxxxxxxxxxxxxxxxxx"],
+  "WXPUSHER_API_URL": "https://wxpusher.zjiecode.com/api/send/message",
+
+  "CF_ENABLED": false,
+  "_cf_说明": "需要在 Cloudflare DNS 上更新优选 IP 时才开启；先在 CF 后台创建 Token（Zone/DNS 编辑权限）",
+  "CF_API_TOKEN": "",
+  "CF_ZONE_ID": "",
+  "CF_DNS_RECORD_NAME": "",
+  "DNS_RECORD_TYPE": "TXT",
+
+  "OUTPUT_FILE": "ip.txt",
+  "ENABLE_LOGGING": true,
+  "LOG_FILE": "cfnb.log",
+  "FORCE_DIRECT": false,
+  "PROJECT_TAG": "稳定版",
+
+  "IP_TXT_SHOW_LATENCY": false,
+  "IP_TXT_SHOW_HTTP_LATENCY": true,
+  "IP_TXT_SHOW_BANDWIDTH": true,
+  "IP_TXT_SHOW_HTTP_JITTER": false
+}
