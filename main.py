@@ -68,11 +68,23 @@ def _tcp_open_v6(addr, port, timeout):
 
 def _discover_ipv6_seeds():
     """解析 Cloudflare 主机名 AAAA 记录拿到『确定可达』的 IPv6 种子地址；
-    若解析失败（如环境无 IPv6 DNS）则退回内置种子。返回 IPv6Address 列表。"""
+    若解析失败（如环境无 IPv6 DNS）则退回内置种子。返回 IPv6Address 列表。
+
+    关键：只用 speed.cloudflare.com 作为首选种子源。
+    实测 Cloudflare 有两套 IPv6 段，行为不同：
+      - 2a06:98c1:58::  → TCP 可通，且 speed.cloudflare.com 测速端点正常（4/4 成功）
+      - 2606:4700::    → TCP 可通，但测速端点 0% 响应（下载 0 字节超时）
+    若用 www.cloudflare.com / cloudflare.com 做种子，会引入大量不可测速的
+    2606:4700:: 段节点，它们在带宽测速环节被 100% 淘汰，导致 IPv6 产出为 0。
+    """
     hosts = cfg.get("IPV6_SEED_HOSTS") or ["speed.cloudflare.com", "www.cloudflare.com", "cloudflare.com"]
+    # 只保留首个 host 作为种子源（speed.cloudflare.com），其余仅作 DNS 失败时的兜底
+    prefer = hosts[:1] if hosts else []
+    fallback = hosts[1:] if len(hosts) > 1 else []
     seeds = []
     seen = set()
-    for h in hosts:
+
+    def _collect(h):
         try:
             infos = socket.getaddrinfo(h, 443, socket.AF_INET6, socket.SOCK_STREAM)
             for info in infos:
@@ -83,7 +95,14 @@ def _discover_ipv6_seeds():
                         seen.add(a)
                         seeds.append(a)
         except Exception:
-            continue
+            pass
+
+    for h in prefer:
+        _collect(h)
+    # 首选源没解析出结果时，才用兜底源
+    if not seeds:
+        for h in fallback:
+            _collect(h)
     if not seeds:
         for s in (cfg.get("IPV6_FALLBACK_SEEDS") or []):
             try:
@@ -161,6 +180,19 @@ def generate_ipv6_candidates():
                 pass
     if not live64:
         return []
+    # 前缀白名单过滤：只保留测速端点正常的 IPv6 段（见 IPV6_PREFIX_ALLOWLIST 注释）。
+    # 白名单为空时不做限制，保持原行为。
+    if IPV6_PREFIX_ALLOWLIST:
+        _allow = [p.lower() for p in IPV6_PREFIX_ALLOWLIST]
+        _before = len(live64)
+        live64 = [n for n in live64
+                  if any(str(n).lower().startswith(p) for p in _allow)]
+        if _before != len(live64):
+            print(f"IPv6 前缀白名单过滤（{'/'.join(_allow)}）："
+                  f"{_before} -> {len(live64)} 个 /64 前缀")
+        if not live64:
+            print("IPv6 前缀白名单过滤后无可用前缀，放弃 IPv6 候选。")
+            return []
     random.shuffle(live64)
     per = max(1, count // len(live64))
     nodes = []
@@ -199,7 +231,12 @@ def _ensure_ipv6_representation(final_selected, v6_pool, min_v6=None):
     v6_pool: IPv6 候选池，元素为 (node, score)。优先用带带宽得分的节点；
     若带宽探测失败导致 scored_nodes 为空，则退回「已通过 TCP + HTTP /cdn-cgi/trace
     校验」的 IPv6 节点（已确属真实 Cloudflare 边缘），保证不丢 IPv6。
-    若数量仍不足，用得分最高的 IPv6 顶替得分最低的 IPv4，腾出名额。"""
+
+    修正（2026-10-24）：旧实现是「替换式」——为凑够 min_v6，把 final_selected 里的
+    IPv4 全部移除再塞入 IPv6。结果 IPv6 保底反而把 IPv4 挤光（实测 4 个 IPv4 被换成
+    5 个 IPv6，产出变成纯 IPv6），且产出总数不增反减。
+    现在改为「补充式」：优先直接追加 IPv6，只有在超出输出上限时才从得分最低的
+    IPv4 里顶替腾位，保证 IPv4/IPv6 双保底同时成立。"""
     if min_v6 is None:
         min_v6 = IPV6_MIN_IN_OUTPUT
     min_v6 = int(min_v6)
@@ -219,14 +256,19 @@ def _ensure_ipv6_representation(final_selected, v6_pool, min_v6=None):
     need = min_v6 - len(v6_in)
     if not pool:
         return final_selected
-    removable = sorted([n for n in final_selected if not _is_ipv6_node(n)],
-                       key=lambda n: best.get(n, 0.0))
+    # 输出总量上限：超出时不能简单追加，需要从得分最低的 IPv4 顶替
+    cap = int(GLOBAL_TOP_N) if USE_GLOBAL_MODE else 0
     result = list(final_selected)
     added = 0
     for node, _ in pool:
         if added >= need:
             break
-        if removable:
+        if cap and len(result) >= cap:
+            # 已达上限：从得分最低的 IPv4 里腾位置（IPv4 优先让位给 IPv6）
+            removable = sorted([n for n in result if not _is_ipv6_node(n)],
+                               key=lambda n: best.get(n, 0.0))
+            if not removable:
+                break
             result.remove(removable.pop(0))
         result.append(node)
         added += 1
@@ -239,7 +281,10 @@ def _ensure_ipv4_representation(final_selected, v4_pool, min_v4=None):
     _ensure_ipv6_representation 的对称逻辑：IPv6 保底解决"丢 IPv6"，
     本函数解决"IPv4 被 IPv6 高分挤光"（2026-10-20 曾整表 17 个全 IPv6）。
     v4_pool: IPv4 候选池，元素为 (node, score)；同样优先带宽得分，
-    数量不足时用得分最高的 IPv4 顶替得分最低的 IPv6 腾出名额。"""
+    数量不足时用得分最高的 IPv4 顶替得分最低的 IPv6 腾出名额。
+
+    与 IPv6 版本一致采用「补充式」策略：优先直接追加，
+    仅在超出输出上限时才顶替，避免把另一协议全部挤光。"""
     if min_v4 is None:
         min_v4 = IPV4_MIN_IN_OUTPUT
     min_v4 = int(min_v4)
@@ -258,14 +303,17 @@ def _ensure_ipv4_representation(final_selected, v4_pool, min_v4=None):
     need = min_v4 - len(v4_in)
     if not pool:
         return final_selected
-    removable = sorted([n for n in final_selected if _is_ipv6_node(n)],
-                       key=lambda n: best.get(n, 0.0))
+    cap = int(GLOBAL_TOP_N) if USE_GLOBAL_MODE else 0
     result = list(final_selected)
     added = 0
     for node, _ in pool:
         if added >= need:
             break
-        if removable:
+        if cap and len(result) >= cap:
+            removable = sorted([n for n in result if _is_ipv6_node(n)],
+                               key=lambda n: best.get(n, 0.0))
+            if not removable:
+                break
             result.remove(removable.pop(0))
         result.append(node)
         added += 1
@@ -491,12 +539,13 @@ def load_config():
         "ALLOWED_COUNTRIES": ["US"],
         "PRE_FILTER_BLOCKED_ENABLED": True,
         "PRE_FILTER_BLOCKED_COUNTRIES": ["CN"],
-        "PRE_FILTER_PORT_ENABLED": True,
+        "PRE_FILTER_PORT_ENABLED": False,
         "PRE_FILTER_PORTS": [443],
         "ENABLE_WXPUSHER": True,
         "WXPUSHER_APP_TOKEN": "your_app_token_here",
         "WXPUSHER_UIDS": ["your_uid_here"],
         "WXPUSHER_API_URL": "https://wxpusher.zjiecode.com/api/send/message",
+        "PROJECT_TAG": "cf-ip-stable",
         "NOTIFY_TIMEOUT": 3,
         "NOTIFY_CONNECT_TIMEOUT": 3,
         "CF_ENABLED": True,
@@ -564,10 +613,17 @@ def load_config():
         "DNS_IP_RISK_FILTER_ENABLED": False,
         "DNS_IP_RISK_MAX_LEVEL": "高风险",
         "DNS_UPDATE_TARGET_COUNT": 15,
-        "BANDWIDTH_SIZE_MB": 1.0,
-        "BANDWIDTH_TIMEOUT": 3,
+        # 测速文件大小：2MB（原版配置）。
+        # 1MB 会让 IPv6 测速失真（IPv6 首字节延迟约 0.7s，1MB 的纯传输时间被摊薄，
+        # 算出速度只有真实值的 1/7）；5MB 则在本机并发下压力过大、反而拉低成功率。
+        "BANDWIDTH_SIZE_MB": 2.0,
+        "BANDWIDTH_TIMEOUT": 6,
         "BANDWIDTH_RETRY_MAX": 2,
         "BANDWIDTH_RETRY_DELAY": 3,
+        "BANDWIDTH_MIN_SPEED_MBPS": 10.0,
+        # IPv6 独立门槛：家宽/移动网络的 IPv6 链路通常比 IPv4 慢（本机实测约 1/2），
+        # 用同一门槛会把 IPv6 节点全部误杀。设 5Mbps 兼顾「确实可用」与「不误杀」。
+        "BANDWIDTH_MIN_SPEED_MBPS_IPV6": 5.0,
         "BANDWIDTH_URL_TEMPLATE": "{scheme}://speed.cloudflare.com:{port}/__down?bytes={bytes}",
         "BANDWIDTH_PROCESS_BUFFER": 2,
         "BANDWIDTH_CONNECT_TIMEOUT": 3,
@@ -577,11 +633,13 @@ def load_config():
         "MAX_WORKERS": 300,
         "AVAILABILITY_WORKERS": 32,
         "FALLBACK_WORKERS": 32,
-        "BANDWIDTH_WORKERS": 3,
+        "BANDWIDTH_WORKERS": 8,
         "HTTP_TEST_WORKERS": 32,
         "DNS_UPDATE_MAX_RETRIES": 3,
         "DNS_UPDATE_RETRY_DELAY": 3,
         "GITHUB_SYNC_MAX_RETRIES": 3,
+        "OUTPUT_GUARD_RATIO": 0.3,
+        "OUTPUT_MIN_NODES": 5,
         "GITHUB_SYNC_RETRY_DELAY": 3,
         "GIT_SYNC_PROCESS_TIMEOUT": 180,
         "AD_HEADER_ENABLED": False,
@@ -608,6 +666,10 @@ def load_config():
         # ===== IPv6 支持（合并进 ip.txt）=====
         "IPV6_ENABLED": True,
         "IPV6_SEED_HOSTS": ["speed.cloudflare.com", "www.cloudflare.com", "cloudflare.com"],
+        # IPv6 前缀白名单：只保留测速端点正常的段。
+        # 实测 2606:4700:: 段 TCP 可通但 speed.cloudflare.com 测速 0% 响应，
+        # 纳入候选只会在带宽测速环节被全数淘汰，白白占用候选池名额。
+        "IPV6_PREFIX_ALLOWLIST": ["2a06:98c1:58"],
         "IPV6_FALLBACK_SEEDS": ["2400:cb00:2049:1::a29f:2020", "2606:4700:4700::1111"],
         "IPV6_SCAN_TIMEOUT": 1.0,
         "IPV6_SCAN_WORKERS": 256,
@@ -655,13 +717,19 @@ PRE_FILTER_BLOCKED_COUNTRIES = [c.upper() for c in cfg["PRE_FILTER_BLOCKED_COUNT
 PRE_FILTER_PORT_ENABLED = cfg["PRE_FILTER_PORT_ENABLED"]
 PRE_FILTER_PORTS = [str(p) for p in cfg["PRE_FILTER_PORTS"]]
 ENABLE_WXPUSHER = cfg["ENABLE_WXPUSHER"]
-WXPUSHER_APP_TOKEN = cfg["WXPUSHER_APP_TOKEN"]
-WXPUSHER_UIDS = cfg["WXPUSHER_UIDS"]
+# 密钥优先读环境变量，config.json 里的明文仅作为回退。
+# 这样可以把真实 token 移出 config.json（如 systemd EnvironmentFile / ~/.config 私密文件），
+# 降低明文落盘与误提交的风险。
+WXPUSHER_APP_TOKEN = os.environ.get("WXPUSHER_APP_TOKEN") or cfg["WXPUSHER_APP_TOKEN"]
+WXPUSHER_UIDS = (os.environ.get("WXPUSHER_UIDS").split(",")
+                  if os.environ.get("WXPUSHER_UIDS")
+                  else cfg["WXPUSHER_UIDS"])
 WXPUSHER_API_URL = cfg["WXPUSHER_API_URL"]
+PROJECT_TAG = cfg["PROJECT_TAG"]
 NOTIFY_TIMEOUT = cfg["NOTIFY_TIMEOUT"]
 NOTIFY_CONNECT_TIMEOUT = cfg["NOTIFY_CONNECT_TIMEOUT"]
 CF_ENABLED = cfg["CF_ENABLED"]
-CF_API_TOKEN = cfg["CF_API_TOKEN"]
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN") or cfg["CF_API_TOKEN"]
 CF_ZONE_ID = cfg["CF_ZONE_ID"]
 CF_DNS_RECORD_NAME = cfg["CF_DNS_RECORD_NAME"]
 CF_TTL = cfg["CF_TTL"]
@@ -716,6 +784,8 @@ BANDWIDTH_SIZE_MB = cfg["BANDWIDTH_SIZE_MB"]
 BANDWIDTH_TIMEOUT = cfg["BANDWIDTH_TIMEOUT"]
 BANDWIDTH_RETRY_MAX = cfg["BANDWIDTH_RETRY_MAX"]
 BANDWIDTH_RETRY_DELAY = cfg["BANDWIDTH_RETRY_DELAY"]
+BANDWIDTH_MIN_SPEED_MBPS = float(cfg.get("BANDWIDTH_MIN_SPEED_MBPS", 0.0) or 0.0)
+BANDWIDTH_MIN_SPEED_MBPS_IPV6 = float(cfg.get("BANDWIDTH_MIN_SPEED_MBPS_IPV6", 0.0) or 0.0)
 BANDWIDTH_URL_TEMPLATE = cfg["BANDWIDTH_URL_TEMPLATE"]
 BANDWIDTH_PROCESS_BUFFER = cfg["BANDWIDTH_PROCESS_BUFFER"]
 BANDWIDTH_CONNECT_TIMEOUT = cfg["BANDWIDTH_CONNECT_TIMEOUT"]
@@ -730,6 +800,8 @@ HTTP_TEST_WORKERS = cfg["HTTP_TEST_WORKERS"]
 DNS_UPDATE_MAX_RETRIES = cfg["DNS_UPDATE_MAX_RETRIES"]
 DNS_UPDATE_RETRY_DELAY = cfg["DNS_UPDATE_RETRY_DELAY"]
 GITHUB_SYNC_MAX_RETRIES = cfg["GITHUB_SYNC_MAX_RETRIES"]
+OUTPUT_GUARD_RATIO = cfg.get("OUTPUT_GUARD_RATIO", 0.3)
+OUTPUT_MIN_NODES = cfg.get("OUTPUT_MIN_NODES", 5)
 GITHUB_SYNC_RETRY_DELAY = cfg["GITHUB_SYNC_RETRY_DELAY"]
 GIT_SYNC_PROCESS_TIMEOUT = cfg["GIT_SYNC_PROCESS_TIMEOUT"]
 AD_HEADER_ENABLED = cfg["AD_HEADER_ENABLED"]
@@ -755,6 +827,7 @@ STABILITY_MIN_CONSISTENCY = cfg["STABILITY_MIN_CONSISTENCY"]
 # IPv6 支持（合并进 ip.txt）
 IPV6_ENABLED = cfg["IPV6_ENABLED"]
 IPV6_SEED_HOSTS = cfg["IPV6_SEED_HOSTS"]
+IPV6_PREFIX_ALLOWLIST = cfg.get("IPV6_PREFIX_ALLOWLIST") or []
 IPV6_FALLBACK_SEEDS = cfg["IPV6_FALLBACK_SEEDS"]
 IPV6_SCAN_TIMEOUT = cfg["IPV6_SCAN_TIMEOUT"]
 IPV6_SCAN_WORKERS = cfg["IPV6_SCAN_WORKERS"]
@@ -870,10 +943,11 @@ def send_wxpusher_notification(content, summary):
     if not ENABLE_WXPUSHER:
         return
     try:
+        # 加上项目标识，避免原版与稳定版的消息无法区分
         payload = {
             "appToken": WXPUSHER_APP_TOKEN,
-            "content": content,
-            "summary": summary,
+            "content": f"[{PROJECT_TAG}] {content}",
+            "summary": f"[{PROJECT_TAG}] {summary}",
             "uids": WXPUSHER_UIDS
         }
         headers = {"Content-Type": "application/json; charset=utf-8"}
@@ -1375,9 +1449,13 @@ async def query_new_ips(new_ips, token_list, concurrency, min_interval, trust_en
             if f:
                 f.close()
     print()
-    if total > 0 and failed == total:
+    # 仅在样本量足够大时才判定"token 全部失效"，
+    # 否则个别 IP 查询失败（如 IP 已下线）会造成误报
+    if total >= 20 and failed == total:
         send_wxpusher_notification("IP地区校准：所有IP查询均失败，可能所有token均已失效。", "IP校准全失败")
         print("警告：所有 IP 地区校准失败，可能所有 token 已失效。")
+    elif total > 0 and failed == total:
+        print(f"提示：本次 {total} 个待查 IP 全部查询失败（样本量小，不判定 token 失效）。")
     return result
 
 def calibrate_regions(nodes, token_file, cache_file):
@@ -2134,7 +2212,8 @@ def sync_to_github():
 
     if sys.platform != "win32":
         try:
-            os.chmod(script_path, 0o755)
+            # 0o700: 脚本内含 GitHub Token，仅允许属主读写执行
+            os.chmod(script_path, 0o700)
         except Exception:
             pass
 
@@ -2178,17 +2257,27 @@ def sync_to_github():
 def evaluate_output_guard(final_count, prev_count):
     """最小产出保护判定。
 
-    返回 (是否拦截, 本次要求的阈值)。
-      - 阈值 = max(MIN_OUTPUT_NODES, 上次数量 × MIN_KEEP_RATIO)
-      - 若本次有环节硬降级（结果来自上一层未验证节点），阈值提高到不低于上次
+    历史事故：2026-10-17 20:05 那次只产出 1 个节点（正常 30~36），
+    却照常覆盖并 force push，导致公开订阅降级了 12 小时。
+
+    判定采用「双重条件」，只有同时满足才拦截，避免误伤正常的质量过滤：
+      1) 相对崩塌：final < prev * ratio（产出相对历史大幅萎缩）
+      2) 绝对过低：final < min_nodes（本次几乎没产出可用节点）
+
+    只满足其一不拦截——例如带宽门槛把 15 个节点过滤到 5 个，
+    属于质量过滤的正常结果，不应保留旧文件；而跌到 1~2 个则是运行异常。
+
+    首次运行（prev_count == 0）无历史基线，不拦截。
     """
-    if prev_count > 0:
-        need = max(MIN_OUTPUT_NODES, int(prev_count * MIN_KEEP_RATIO))
-    else:
-        need = MIN_OUTPUT_NODES
-    if DEGRADED_STAGES and final_count < prev_count:
-        need = max(need, prev_count)
-    return final_count < need, need
+    if prev_count <= 0:
+        return False, 0
+    ratio = float(OUTPUT_GUARD_RATIO)
+    min_nodes = int(OUTPUT_MIN_NODES)
+    need_rel = max(1, int(prev_count * ratio))
+    # final < need_rel 且 final < min_nodes → 判定为异常塌陷
+    if final_count < need_rel and final_count < min_nodes:
+        return True, need_rel
+    return False, need_rel
 
 
 def count_output_nodes(path):
@@ -2403,6 +2492,22 @@ def main():
     for attempt in range(1, BANDWIDTH_RETRY_MAX + 1):
         print(f"\n[带宽测速] 第 {attempt} 轮测试...")
         bw_results = bandwidth_filter(candidates_after_http)
+        # 下载速度阈值过滤：剔除低于设定阈值的节点，避免把 0 速/超低速节点发布出去。
+        # IPv4 与 IPv6 分别用各自门槛（IPv6 链路天然较慢，同门槛会全数误杀）。
+        if BANDWIDTH_MIN_SPEED_MBPS > 0 or BANDWIDTH_MIN_SPEED_MBPS_IPV6 > 0:
+            before_count = len(bw_results)
+            _kept = []
+            for _n, _sp in bw_results:
+                _is_v6 = _is_ipv6_node(_n)
+                _lim = BANDWIDTH_MIN_SPEED_MBPS_IPV6 if _is_v6 else BANDWIDTH_MIN_SPEED_MBPS
+                if _lim <= 0 or _sp >= _lim:
+                    _kept.append((_n, _sp))
+            bw_results = _kept
+            after_count = len(bw_results)
+            if before_count != after_count:
+                print(f"下载速度阈值过滤（IPv4≥{BANDWIDTH_MIN_SPEED_MBPS} / "
+                      f"IPv6≥{BANDWIDTH_MIN_SPEED_MBPS_IPV6} Mbps）："
+                      f"{before_count} -> {after_count} 个节点")
         RUN_STATS["带宽有效"] = len(bw_results)
         if bw_results:
             break
@@ -2448,6 +2553,38 @@ def main():
             final_selected, _stab_state = stability_layer.apply_stability(
                 _stab_state, scored_nodes, cfg,
                 USE_GLOBAL_MODE, GLOBAL_TOP_N, PER_COUNTRY_TOP_N)
+
+            # 带宽门槛：稳定性层会「宽限保留」本轮未测到的旧 IP（防抖设计），
+            # 这些节点本轮没有实测速度，若直接发布就会显示成 0.00Mbps。
+            # 这里用其历史实测速度（last_speed）判定：低于阈值则剔除。
+            # IPv4 / IPv6 分别用各自门槛，避免 IPv6 被 IPv4 门槛误杀。
+            if BANDWIDTH_MIN_SPEED_MBPS > 0 or BANDWIDTH_MIN_SPEED_MBPS_IPV6 > 0:
+                _hist_speed = stability_layer.last_speed_map(_stab_state)
+                _before_gate = len(final_selected)
+                _dropped = []
+                _kept = []
+                for _n in final_selected:
+                    _sp = speed_map.get(_n)
+                    if _sp is None:
+                        _sp = _hist_speed.get(_n, 0.0)
+                    _lim = (BANDWIDTH_MIN_SPEED_MBPS_IPV6 if _is_ipv6_node(_n)
+                            else BANDWIDTH_MIN_SPEED_MBPS)
+                    if _lim <= 0 or _sp >= _lim:
+                        _kept.append(_n)
+                    else:
+                        _dropped.append(_n)
+                if _dropped:
+                    print(f"\n[带宽门槛] 稳定性层宽限保留的节点中，{len(_dropped)} 个"
+                          f"（含历史速度）低于门槛，已剔除")
+                final_selected = _kept
+                # 同步清理稳定性层状态，避免这些节点下一轮又被宽限保留
+                if _dropped:
+                    _drop_set = set(_dropped)
+                    _stab_state["published"] = [n for n in _stab_state.get("published", [])
+                                                if n not in _drop_set]
+                    for _c, _lst in list(_stab_state.get("published_by_country", {}).items()):
+                        _stab_state["published_by_country"][_c] = [n for n in _lst if n not in _drop_set]
+
             stability_layer.save_state(STABILITY_STATE_FILE, _stab_state)
             print(f"\n[稳定性层] 已发布 {len(final_selected)} 个节点"
                   f"（滞回/确认已生效，发布集合仅在被证实时变更）")
@@ -2470,12 +2607,7 @@ def main():
 
     # IPv6 保底：保证合并输出中始终含一定数量的 IPv6 节点
     # 候选池优先取带带宽得分的 scored_nodes，退回已由 HTTP /cdn-cgi/trace 校验的 IPv6
-    _v6_pool = []
-    if 'scored_nodes' in locals():
-        _v6_pool += [(n, s) for n, s, *_ in scored_nodes]
-    _v6_pool += [(n, 0.0) for n in candidates_after_http if _is_ipv6_node(n)]
-
-    # IPv4/IPv6 双保底：各自保证最低节点数。
+    # IPv6/IPv4 双保底：各自保证最低节点数。
     # 保底之和超过输出总量（全局模式 GLOBAL_TOP_N）时等比缩减，避免互相挤爆。
     _min_v6 = int(IPV6_MIN_IN_OUTPUT)
     _min_v4 = int(IPV4_MIN_IN_OUTPUT)
@@ -2486,13 +2618,47 @@ def main():
         _min_v6 = max(1, int(_min_v6 * _scale))
         print(f"\n[提示] IPv4/IPv6 保底之和超过输出上限 {_top_cap}，"
               f"已等比缩减为 IPv4≥{_min_v4}、IPv6≥{_min_v6}。")
+
+    # 保底候选池：只用「本轮实测有速度得分」的节点。
+    # 历史问题：旧实现把 candidates_after_http（仅过 HTTP、未测速）整池作为保底来源，
+    # 得分记 0.0，导致 15 个节点里 12 个以 0.00Mbps 发布出去。
+    # 现在保底池只接受真实测速节点；测速全部失败时（bw_results 为空）才退回 HTTP 池。
+    _bw_ok = bool(bw_results)
+    if _bw_ok:
+        _v6_pool = [(n, s) for n, s, *_ in scored_nodes if _is_ipv6_node(n)]
+        _v4_pool = [(n, s) for n, s, *_ in scored_nodes if not _is_ipv6_node(n)]
+    else:
+        # 带宽测速整体失败：退回已过 HTTP 校验的节点，至少保证地址真实可用
+        _v6_pool = [(n, 0.0) for n in candidates_after_http if _is_ipv6_node(n)]
+        _v4_pool = [(n, 0.0) for n in candidates_after_http if not _is_ipv6_node(n)]
+
+    # 保底数量不能超过池子实际可用量，否则保底会「挤掉」真实优选节点去凑数
+    if _bw_ok:
+        _avail_v6 = len({n for n, _ in _v6_pool})
+        _avail_v4 = len({n for n, _ in _v4_pool})
+        if _min_v6 > _avail_v6:
+            print(f"\n[提示] IPv6 保底 {_min_v6} 超过实测可用 {_avail_v6}，下调为 {_avail_v6}。")
+            _min_v6 = _avail_v6
+        if _min_v4 > _avail_v4:
+            print(f"\n[提示] IPv4 保底 {_min_v4} 超过实测可用 {_avail_v4}，下调为 {_avail_v4}。")
+            _min_v4 = _avail_v4
+
     final_selected = _ensure_ipv6_representation(final_selected, _v6_pool, _min_v6)
-    _v4_pool = []
-    if 'scored_nodes' in locals():
-        _v4_pool += [(n, s) for n, s, *_ in scored_nodes if not _is_ipv6_node(n)]
-    _v4_pool += [(n, 0.0) for n in candidates_after_http if not _is_ipv6_node(n)]
     final_selected = _ensure_ipv4_representation(final_selected, _v4_pool, _min_v4)
     print(f"\n[规模控制] 输出目标 {_top_cap} 个，其中 IPv4≥{_min_v4}、IPv6≥{_min_v6}。")
+
+    # 回填：稳定性层宽限保留的节点本轮未测速，用其历史实测速度显示，
+    # 避免 ip.txt 里出现「有节点但速度空白/0.00Mbps」的误导信息。
+    if STABILITY_ENABLED and speed_map:
+        _hist = stability_layer.last_speed_map(stability_layer.load_state(STABILITY_STATE_FILE))
+        if _hist:
+            _filled = 0
+            for _n in final_selected:
+                if _n not in speed_map and _hist.get(_n):
+                    speed_map[_n] = _hist[_n]
+                    _filled += 1
+            if _filled:
+                print(f"[速度回填] {_filled} 个保留节点使用历史实测速度显示")
 
     # 注入的保底节点按得分重排，保持"最优在前"的展示顺序
     if 'scored_nodes' in locals() and scored_nodes:
@@ -2559,28 +2725,25 @@ def main():
 
     sync_to_github()
 
+    # ---- 成功完成通知：汇总本次结果 ----
+    try:
+        _degraded = list(DEGRADED_STAGES)
+        _lines = [f"共优选 {len(final_selected)} 个节点，已保存 {OUTPUT_FILE} 并同步到 GitHub。"]
+        if final_selected:
+            _lines.append(f"最快节点：{final_selected[0]}")
+        if _degraded:
+            _lines.append("降级环节：" + "、".join(_degraded))
+        else:
+            _lines.append("全部环节正常，无降级。")
+        send_wxpusher_notification(
+            content="\n".join(_lines),
+            summary=f"优选完成：{len(final_selected)} 个节点"
+        )
+    except Exception as e:
+        print(f"发送完成通知失败: {e}")
+
 if __name__ == "__main__":
     import atexit
-
-    # ---- [临时诊断] 启动身份记录：谁在用哪个副本运行本程序（排查结束后移除，勿提交）----
-    try:
-        import ctypes as _ct
-        _ppid = os.getppid()
-        _parent = "?"
-        _h = _ct.windll.kernel32.OpenProcess(0x1000, False, _ppid)
-        if _h:
-            _b = _ct.create_unicode_buffer(260)
-            _s = _ct.c_ulong(260)
-            if _ct.windll.kernel32.QueryFullProcessImageNameW(_h, 0, _b, _ct.byref(_s)):
-                _parent = _b.value
-            _ct.windll.kernel32.CloseHandle(_h)
-        sys.stderr.write("PROBE-MAIN file=%s cwd=%s pid=%d ppid=%d parent=%s at=%s\n" % (
-            os.path.abspath(__file__), os.getcwd(), os.getpid(), _ppid, _parent,
-            time.strftime("%Y-%m-%d %H:%M:%S")))
-        sys.stderr.flush()
-    except Exception as _e:
-        sys.stderr.write("PROBE-MAIN failed: %s\n" % _e)
-    # ------------------------------------------------------------------
 
     # ---- 单实例检查：已有实例在跑就直接退出 ----
     if not acquire_single_instance():
