@@ -105,6 +105,11 @@ def _update_state(state, scored_nodes, cfg):
             rec["absent"] = 0
         rec["consecutive_top"] = rec.get("consecutive_top", 0) + 1
         rec["last_seen"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        # 记录本轮实测速度：供「本轮未测到但需宽限保留」的节点回填速度，
+        # 避免保留节点在 ip.txt 里既无速度又被误判为 0 速。
+        if len(item) > 2 and isinstance(item[2], (int, float)):
+            rec["last_speed"] = float(item[2])
+            rec["last_speed_at"] = rec["last_seen"]
 
     # 未在本轮出现的已追踪 IP：缺勤 +1，连续计数清零
     for node, rec in state["ips"].items():
@@ -113,6 +118,41 @@ def _update_state(state, scored_nodes, cfg):
             rec["consecutive_top"] = 0
 
     state["run_count"] = state.get("run_count", 0) + 1
+    _prune_state(state, cfg)
+
+
+def _prune_state(state, cfg):
+    """清理僵尸记录：长期缺勤且不在发布集合中的 IP 直接移除。
+
+    状态文件曾膨胀到 945KB / 3957 条，其中 3534 条是 absent 计数极高的
+    死 IP，既拖慢读写又无保留价值。仅保留发布集合内 + 近期活跃的条目。
+    """
+    max_absent = int(cfg.get("STABILITY_PRUNE_ABSENT", 30))
+    published = set(state.get("published", []))
+    for lst in state.get("published_by_country", {}).values():
+        published.update(lst)
+    ips = state.get("ips", {})
+    removed = 0
+    for node in list(ips.keys()):
+        if node in published:
+            continue
+        rec = ips.get(node) or {}
+        if rec.get("absent", 0) > max_absent:
+            del ips[node]
+            removed += 1
+    if removed:
+        print(f"[稳定性层] 已清理 {removed} 条长期缺勤的僵尸记录")
+    return removed
+
+
+def last_speed_map(state):
+    """返回 {node: 上次实测速度}，供发布集合回填带宽显示。"""
+    out = {}
+    for node, rec in (state.get("ips") or {}).items():
+        sp = (rec or {}).get("last_speed")
+        if isinstance(sp, (int, float)) and sp > 0:
+            out[node] = float(sp)
+    return out
 
 
 def _stable_score(node, raw, state, cfg):
