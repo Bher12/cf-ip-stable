@@ -1086,12 +1086,20 @@ def _parse_json_nodes(data):
     return nodes
 
 
+# 本地补丁 2026-10-27：AVAILABILITY_CHECK_API 会对 python-requests 默认 UA 返回 403，
+# 导致「可用性二次筛选」永远 0% 通过、国家查询也拿不到结果。统一带浏览器 UA。
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+
+
 def _query_country(ip, port):
     try:
         resp = requests.get(
             AVAILABILITY_CHECK_API,
             params={"proxyip": f"{ip}:{port}"},
             timeout=(AVAILABILITY_CONNECT_TIMEOUT, AVAILABILITY_TIMEOUT),
+            headers={"User-Agent": _BROWSER_UA},
+            proxies={"http": None, "https": None},
             verify=False
         )
         if resp.status_code == 200:
@@ -1586,6 +1594,8 @@ def check_availability(node_str):
                 AVAILABILITY_CHECK_API,
                 params={"proxyip": proxyip},
                 timeout=(AVAILABILITY_CONNECT_TIMEOUT, AVAILABILITY_TIMEOUT),
+                headers={"User-Agent": _BROWSER_UA},
+            proxies={"http": None, "https": None},
                 verify=False
             )
             if resp.status_code == 200:
