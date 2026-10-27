@@ -1007,10 +1007,28 @@ def send_wxpusher_notification(content, summary):
             headers=headers,
             timeout=(NOTIFY_CONNECT_TIMEOUT, NOTIFY_TIMEOUT)
         )
-        if resp.status_code == 200:
-            print("微信通知已发送")
+        if resp.status_code != 200:
+            print(f"微信通知发送失败: HTTP {resp.status_code}")
+            return
+        # WxPusher 的错误码在 body 里，HTTP 200 不代表发送成功
+        # （appToken 错误时也是 200 + code 1001）
+        try:
+            ret = resp.json()
+        except Exception:
+            print(f"微信通知发送失败: 响应非 JSON -> {resp.text[:120]}")
+            return
+        code = ret.get("code")
+        if code != 1000:
+            print(f"微信通知发送失败: code={code} msg={ret.get('msg')}")
+            return
+        # code 1000 表示已受理，再看每个 UID 的投递结果
+        items = ret.get("data") or []
+        bad = [it for it in items
+               if isinstance(it, dict) and str(it.get("status", "")).lower() not in ("success", "ok", "")]
+        if bad:
+            print(f"微信通知部分失败: {bad[:2]}")
         else:
-            print(f"微信通知发送失败: {resp.status_code}")
+            print("微信通知已发送")
     except Exception as e:
         print(f"微信通知异常: {e}")
 
