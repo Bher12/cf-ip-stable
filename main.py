@@ -1023,12 +1023,14 @@ def send_wxpusher_notification(content, summary):
             return
         # code 1000 表示已受理，再看每个 UID 的投递结果
         items = ret.get("data") or []
+        # 每条投递记录以 code 为准（1000=已创建发送任务）；
+        # 不能按 status 文本判断——正常返回是中文「创建发送任务成功」，会被误判成失败。
         bad = [it for it in items
-               if isinstance(it, dict) and str(it.get("status", "")).lower() not in ("success", "ok", "")]
+               if isinstance(it, dict) and it.get("code") not in (1000, None)]
         if bad:
             print(f"微信通知部分失败: {bad[:2]}")
         else:
-            print("微信通知已发送")
+            print(f"微信通知已发送（{len(items)} 个接收人）")
     except Exception as e:
         print(f"微信通知异常: {e}")
 
