@@ -663,7 +663,7 @@ def load_config():
         "DIVERSITY_ENABLED": True,
         "MAX_PER_24": 2,
         "MAX_PER_16": 4,
-        "MAX_PER_64": 2,
+        "MAX_PER_64": 8,
         "NEG_CACHE_ENABLED": True,
         "NEG_CACHE_FILE": "neg_cache.json",
         "NEG_FAIL_THRESHOLD": 3,

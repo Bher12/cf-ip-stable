@@ -73,6 +73,16 @@ class TestNegCache(unittest.TestCase):
         self.assertEqual(kept, [good])
         self.assertEqual(skipped, 1)
 
+    def test_prune_keeps_active_records(self):
+        """清理不能把「刚失败 1 次」的活跃记录删掉，否则永远攒不到阈值。"""
+        n = "1.2.3.4:443#US"
+        for _ in range(5):
+            self.c.begin_run()
+            self.c.record_fail(n)
+            self.c.prune()
+        self.assertIn(n, self.c.nodes, "活跃记录不该被 prune 删除")
+        self.assertTrue(self.c.is_cooled(n), "跨轮累计失败应最终进入冷却")
+
 
 class TestDiversity(unittest.TestCase):
     def test_per_24_limit(self):
@@ -92,6 +102,14 @@ class TestDiversity(unittest.TestCase):
         nodes = ["[2a06:98c1:58:0:a:1:2:%d]:443#US" % i for i in range(1, 5)]
         kept, _ = ip_select.apply_diversity(nodes, max_per_24=2, max_per_16=4, max_per_64=2)
         self.assertEqual(len(kept), 2)
+
+    def test_ipv6_cap_must_not_gut_reserve(self):
+        """采样器产出的 IPv6 同属一个 /64：上限 8 时必须完整保留 5 个保底节点。"""
+        nodes = ["[2a06:98c1:58:0:a:1:2:%d]:443#US" % i for i in range(1, 6)]
+        kept, dropped = ip_select.apply_diversity(nodes, max_per_24=2,
+                                                  max_per_16=4, max_per_64=8)
+        self.assertEqual(len(kept), 5, "IPv6 保底不应被多样性约束削掉")
+        self.assertEqual(dropped, [])
 
     def test_keeps_order(self):
         nodes = ["9.9.9.1:443#US", "9.9.9.2:443#US", "9.9.9.3:443#US"]

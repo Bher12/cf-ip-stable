@@ -85,26 +85,32 @@ class NegCache:
     def record_fail(self, node):
         rec = self.nodes.get(node)
         if rec is None:
-            rec = {"fails": 0, "skip_until": 0, "last": ""}
+            rec = {"fails": 0, "skip_until": 0, "last": "", "last_run": self.run_no}
             self.nodes[node] = rec
         rec["fails"] = int(rec.get("fails", 0)) + 1
         rec["last"] = time.strftime("%Y-%m-%d %H:%M")
+        rec["last_run"] = self.run_no
         if rec["fails"] >= self.fail_threshold:
             rec["skip_until"] = self.run_no + self.cooldown_runs
             rec["fails"] = 0          # 进入冷却后重新计数，冷却结束仍有 N 次机会
         self.dirty = True
 
     def prune(self):
-        """清理长期未出现、且不在冷却中的条目，并做容量上限保护。"""
+        """清理「长期没再出现」的条目，并做容量上限保护。
+
+        注意：判据必须用 last_run（最后一次出现），不能用 skip_until。
+        早期版本用 skip_until < run - N 判断，会把「刚失败 1 次、还没攒够
+        阈值」的活跃记录一起删掉，导致冷却永远攒不满 —— 实测踩过这个坑。
+        """
         cutoff = self.run_no - self.prune_after_runs
         dead = [n for n, r in self.nodes.items()
-                if int(r.get("skip_until", 0)) < cutoff]
+                if int(r.get("last_run", 0)) < cutoff]
         for n in dead:
             del self.nodes[n]
         if len(self.nodes) > self.max_entries:
-            # 按「最近一次冷却结束轮次」升序淘汰，保留最新的
+            # 按「最后一次出现轮次」升序淘汰，保留最新的
             ordered = sorted(self.nodes.items(),
-                             key=lambda kv: int(kv[1].get("skip_until", 0)))
+                             key=lambda kv: int(kv[1].get("last_run", 0)))
             for n, _ in ordered[:len(self.nodes) - self.max_entries]:
                 del self.nodes[n]
         if dead:
