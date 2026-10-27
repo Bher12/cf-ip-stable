@@ -659,6 +659,7 @@ def load_config():
         "BANDWIDTH_QUICK_TIMEOUT": 8,
         "BANDWIDTH_QUICK_WORKERS": 16,
         "BANDWIDTH_STAGE2_TOP": 40,
+        "BANDWIDTH_IPV6_RESERVE": 12,
         "PUSH_DEDUP_ENABLED": True,
         "DIVERSITY_ENABLED": True,
         "MAX_PER_24": 2,
@@ -835,6 +836,7 @@ BANDWIDTH_QUICK_SIZE_MB = cfg["BANDWIDTH_QUICK_SIZE_MB"]
 BANDWIDTH_QUICK_TIMEOUT = cfg["BANDWIDTH_QUICK_TIMEOUT"]
 BANDWIDTH_QUICK_WORKERS = cfg["BANDWIDTH_QUICK_WORKERS"]
 BANDWIDTH_STAGE2_TOP = cfg["BANDWIDTH_STAGE2_TOP"]
+BANDWIDTH_IPV6_RESERVE = int(cfg["BANDWIDTH_IPV6_RESERVE"])
 PUSH_DEDUP_ENABLED = cfg["PUSH_DEDUP_ENABLED"]
 DIVERSITY_ENABLED = cfg["DIVERSITY_ENABLED"]
 MAX_PER_24 = int(cfg["MAX_PER_24"])
@@ -1911,7 +1913,10 @@ def measure_bandwidth_curl(node_str, size_mb=None, timeout=None):
     # 单节点测速次数（可从配置读取，默认 2）
     samples_cfg = globals().get("BANDWIDTH_SAMPLES", 2)
     # 至少下载这么多字节才算一次有效样本（避免刚连上就断导致虚高）
-    min_valid_bytes = max(256 * 1024, int(BANDWIDTH_SIZE_MB * 1024 * 1024 * 0.25))
+    # 注意：必须用本次调用的 size_mb，不能用全局 BANDWIDTH_SIZE_MB ——
+    # 两段式测速的快筛只下 1MB，而全局样本是 8MB，按 8MB 的 25% 算门槛(2MB)
+    # 会让所有快筛样本被判无效，快筛永远返回 0（实测踩过）。
+    min_valid_bytes = max(128 * 1024, int(size_mb * 1024 * 1024 * 0.25))
     samples = []
 
     for _ in range(max(1, samples_cfg)):
@@ -2009,10 +2014,21 @@ def bandwidth_filter(candidates):
         quick = _run_bandwidth_pass(candidates, quick_size, BANDWIDTH_QUICK_TIMEOUT,
                                     BANDWIDTH_QUICK_WORKERS, "快筛")
         if quick:
-            shortlist = [n for n, _ in quick[:stage2_top]]
-            print(f"[带宽测速] 快筛有效 {len(quick)} 个，取前 {len(shortlist)} 个进入精测")
+            # 按协议分别取名额：IPv6 节点速度普遍偏低，和 IPv4 混排会被整批挤出精测，
+            # 导致 IPv6 保底拿不到任何可用节点（实测出现过「IPv6 实测可用 0 个」）。
+            _v6 = [n for n, _ in quick if _is_ipv6_node(n)]
+            _v4 = [n for n, _ in quick if not _is_ipv6_node(n)]
+            _v6_keep = min(len(_v6), int(BANDWIDTH_IPV6_RESERVE))
+            _v4_keep = max(0, stage2_top - _v6_keep)
+            shortlist = _v4[:_v4_keep] + _v6[:_v6_keep]
+            print(f"[带宽测速] 快筛有效 {len(quick)} 个，"
+                  f"取 IPv4 {len(_v4[:_v4_keep])} + IPv6 {len(_v6[:_v6_keep])} 个进入精测")
         else:
-            shortlist = list(candidates)[:stage2_top]
+            # 兜底也按协议分名额，否则前 N 个全是 IPv4，IPv6 保底会拿不到节点
+            _c6 = [n for n in candidates if _is_ipv6_node(n)]
+            _c4 = [n for n in candidates if not _is_ipv6_node(n)]
+            _c6_keep = min(len(_c6), int(BANDWIDTH_IPV6_RESERVE))
+            shortlist = _c4[:max(0, stage2_top - _c6_keep)] + _c6[:_c6_keep]
             print(f"[带宽测速] 快筛无有效结果，直接对前 {len(shortlist)} 个精测")
     else:
         shortlist = list(candidates)
