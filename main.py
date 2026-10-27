@@ -16,6 +16,8 @@ import os
 import subprocess
 import shutil
 import json
+import neg_cache
+import ip_select
 import random
 import asyncio
 import aiohttp
@@ -225,7 +227,25 @@ def _node_port(node_str):
     return m.group(1) if m else None
 
 
-def _ensure_ipv6_representation(final_selected, v6_pool, min_v6=None):
+def _pick_victim(result, want_v6_victim, score_map):
+    """在 result 里挑一个「最该被顶替」的节点。
+
+    bug 修复（2026-10-27）：旧实现用 `sorted(..., key=lambda n: best.get(n, 0.0))`
+    再 pop(0)，而 best 里只装了对侧协议的分数 —— 所有待淘汰节点的 key 都是 0.0，
+    稳定排序等于原顺序，pop(0) 淘汰的是**排名最前（最好）**的那个。
+    实测导致稳定性层选出的头部 IPv4 每轮都被 IPv6 保底踢掉。
+
+    现在：按真实分数升序淘汰；分数相同（或缺失）时淘汰排名靠后的那个。
+    """
+    victims = [(i, n) for i, n in enumerate(result) if _is_ipv6_node(n) == want_v6_victim]
+    if not victims:
+        return None
+    scores = score_map or {}
+    victims.sort(key=lambda t: (scores.get(t[1], 0.0), -t[0]))
+    return victims[0][1]
+
+
+def _ensure_ipv6_representation(final_selected, v6_pool, min_v6=None, score_map=None):
     """保证合并输出的 ip.txt 中始终含至少 min_v6 个 IPv6 节点。
 
     v6_pool: IPv6 候选池，元素为 (node, score)。优先用带带宽得分的节点；
@@ -236,7 +256,10 @@ def _ensure_ipv6_representation(final_selected, v6_pool, min_v6=None):
     IPv4 全部移除再塞入 IPv6。结果 IPv6 保底反而把 IPv4 挤光（实测 4 个 IPv4 被换成
     5 个 IPv6，产出变成纯 IPv6），且产出总数不增反减。
     现在改为「补充式」：优先直接追加 IPv6，只有在超出输出上限时才从得分最低的
-    IPv4 里顶替腾位，保证 IPv4/IPv6 双保底同时成立。"""
+    IPv4 里顶替腾位，保证 IPv4/IPv6 双保底同时成立。
+
+    score_map（2026-10-27 新增）：全量节点的真实得分 {node: score}，用于正确挑选
+    被顶替者。不传则退化为「淘汰排名靠后的」，仍优于旧的「淘汰排名最前的」。"""
     if min_v6 is None:
         min_v6 = IPV6_MIN_IN_OUTPUT
     min_v6 = int(min_v6)
@@ -265,17 +288,16 @@ def _ensure_ipv6_representation(final_selected, v6_pool, min_v6=None):
             break
         if cap and len(result) >= cap:
             # 已达上限：从得分最低的 IPv4 里腾位置（IPv4 优先让位给 IPv6）
-            removable = sorted([n for n in result if not _is_ipv6_node(n)],
-                               key=lambda n: best.get(n, 0.0))
-            if not removable:
+            victim = _pick_victim(result, want_v6_victim=False, score_map=score_map)
+            if victim is None:
                 break
-            result.remove(removable.pop(0))
+            result.remove(victim)
         result.append(node)
         added += 1
     return result
 
 
-def _ensure_ipv4_representation(final_selected, v4_pool, min_v4=None):
+def _ensure_ipv4_representation(final_selected, v4_pool, min_v4=None, score_map=None):
     """保证合并输出的 ip.txt 中始终含至少 min_v4 个 IPv4 节点。
 
     _ensure_ipv6_representation 的对称逻辑：IPv6 保底解决"丢 IPv6"，
@@ -284,7 +306,8 @@ def _ensure_ipv4_representation(final_selected, v4_pool, min_v4=None):
     数量不足时用得分最高的 IPv4 顶替得分最低的 IPv6 腾出名额。
 
     与 IPv6 版本一致采用「补充式」策略：优先直接追加，
-    仅在超出输出上限时才顶替，避免把另一协议全部挤光。"""
+    仅在超出输出上限时才顶替，避免把另一协议全部挤光。
+    score_map（2026-10-27 新增）：同 _ensure_ipv6_representation。"""
     if min_v4 is None:
         min_v4 = IPV4_MIN_IN_OUTPUT
     min_v4 = int(min_v4)
@@ -310,11 +333,10 @@ def _ensure_ipv4_representation(final_selected, v4_pool, min_v4=None):
         if added >= need:
             break
         if cap and len(result) >= cap:
-            removable = sorted([n for n in result if _is_ipv6_node(n)],
-                               key=lambda n: best.get(n, 0.0))
-            if not removable:
+            victim = _pick_victim(result, want_v6_victim=True, score_map=score_map)
+            if victim is None:
                 break
-            result.remove(removable.pop(0))
+            result.remove(victim)
         result.append(node)
         added += 1
     return result
@@ -633,6 +655,19 @@ def load_config():
         "MAX_WORKERS": 300,
         "AVAILABILITY_WORKERS": 32,
         "FALLBACK_WORKERS": 32,
+        "BANDWIDTH_QUICK_SIZE_MB": 1.0,
+        "BANDWIDTH_QUICK_TIMEOUT": 8,
+        "BANDWIDTH_QUICK_WORKERS": 16,
+        "BANDWIDTH_STAGE2_TOP": 40,
+        "PUSH_DEDUP_ENABLED": True,
+        "DIVERSITY_ENABLED": True,
+        "MAX_PER_24": 2,
+        "MAX_PER_16": 4,
+        "MAX_PER_64": 2,
+        "NEG_CACHE_ENABLED": True,
+        "NEG_CACHE_FILE": "neg_cache.json",
+        "NEG_FAIL_THRESHOLD": 3,
+        "NEG_COOLDOWN_RUNS": 6,
         "BANDWIDTH_WORKERS": 8,
         "HTTP_TEST_WORKERS": 32,
         "DNS_UPDATE_MAX_RETRIES": 3,
@@ -796,6 +831,19 @@ MAX_WORKERS = cfg["MAX_WORKERS"]
 AVAILABILITY_WORKERS = cfg["AVAILABILITY_WORKERS"]
 FALLBACK_WORKERS = cfg["FALLBACK_WORKERS"]
 BANDWIDTH_WORKERS = cfg["BANDWIDTH_WORKERS"]
+BANDWIDTH_QUICK_SIZE_MB = cfg["BANDWIDTH_QUICK_SIZE_MB"]
+BANDWIDTH_QUICK_TIMEOUT = cfg["BANDWIDTH_QUICK_TIMEOUT"]
+BANDWIDTH_QUICK_WORKERS = cfg["BANDWIDTH_QUICK_WORKERS"]
+BANDWIDTH_STAGE2_TOP = cfg["BANDWIDTH_STAGE2_TOP"]
+PUSH_DEDUP_ENABLED = cfg["PUSH_DEDUP_ENABLED"]
+DIVERSITY_ENABLED = cfg["DIVERSITY_ENABLED"]
+MAX_PER_24 = int(cfg["MAX_PER_24"])
+MAX_PER_16 = int(cfg["MAX_PER_16"])
+MAX_PER_64 = int(cfg["MAX_PER_64"])
+NEG_CACHE_ENABLED = cfg["NEG_CACHE_ENABLED"]
+NEG_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), cfg["NEG_CACHE_FILE"])
+NEG_FAIL_THRESHOLD = cfg["NEG_FAIL_THRESHOLD"]
+NEG_COOLDOWN_RUNS = cfg["NEG_COOLDOWN_RUNS"]
 HTTP_TEST_WORKERS = cfg["HTTP_TEST_WORKERS"]
 DNS_UPDATE_MAX_RETRIES = cfg["DNS_UPDATE_MAX_RETRIES"]
 DNS_UPDATE_RETRY_DELAY = cfg["DNS_UPDATE_RETRY_DELAY"]
@@ -1822,7 +1870,12 @@ def http_server_filter(candidates, config):
     print(f"HTTP检测经 {max_rounds} 轮重试后仍无节点通过，降级使用过滤前候选列表。")
     return candidates, {}, {}
 
-def measure_bandwidth_curl(node_str):
+def measure_bandwidth_curl(node_str, size_mb=None, timeout=None):
+    """测单节点下载速度。size_mb/timeout 可覆盖全局值，供两段式测速复用。"""
+    if size_mb is None:
+        size_mb = BANDWIDTH_SIZE_MB
+    if timeout is None:
+        timeout = BANDWIDTH_TIMEOUT
     m = IP_PORT_PATTERN.match(node_str)
     if not m:
         return (node_str, 0)
@@ -1851,7 +1904,7 @@ def measure_bandwidth_curl(node_str):
     url = BANDWIDTH_URL_TEMPLATE.format(
         scheme=scheme,
         port=port,
-        bytes=int(BANDWIDTH_SIZE_MB * 1024 * 1024)
+        bytes=int(size_mb * 1024 * 1024)
     )
 
     # ---------- 多次测量取中位数，消除突发(burst)抖动 ----------
@@ -1871,12 +1924,12 @@ def measure_bandwidth_curl(node_str):
             "--noproxy", "*",
             "--resolve", f"speed.cloudflare.com:{port}:{ip}",
             "--connect-timeout", str(BANDWIDTH_CONNECT_TIMEOUT),
-            "--max-time", str(BANDWIDTH_TIMEOUT),
+            "--max-time", str(timeout),
         ] + insecure_flag + [url]   # 动态添加 --insecure（如果是 https）
 
         try:
             result = subprocess.run(curl_cmd, capture_output=True, text=True,
-                                    timeout=BANDWIDTH_TIMEOUT + BANDWIDTH_PROCESS_BUFFER)
+                                    timeout=timeout + BANDWIDTH_PROCESS_BUFFER)
             if result.returncode == 0 and result.stdout.strip():
                 parts = result.stdout.strip().split()
                 if len(parts) >= 3:
@@ -1904,22 +1957,16 @@ def measure_bandwidth_curl(node_str):
         median = (samples[n // 2 - 1] + samples[n // 2]) / 2.0
     return (node_str, median)
 
-def bandwidth_filter(candidates):
-    if not candidates:
-        return []
-
-    if not shutil.which("curl"):
-        print("未检测到 curl 命令，带宽测速将跳过。")
-        return []
-
-    print(f"\n开始带宽测速（对前 {len(candidates)} 个节点，并发 {BANDWIDTH_WORKERS}，超时 {BANDWIDTH_TIMEOUT}s）...")
+def _run_bandwidth_pass(nodes, size_mb, timeout, workers, label):
+    """跑一轮并发测速，返回 [(node, speed)]（已按速度降序）。"""
     results = []
     completed = 0
-    total = len(candidates)
+    total = len(nodes)
     last_print = time.time()
 
-    with ThreadPoolExecutor(max_workers=BANDWIDTH_WORKERS) as executor:
-        futures = {executor.submit(measure_bandwidth_curl, node): node for node in candidates}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(measure_bandwidth_curl, n, size_mb, timeout): n
+                   for n in nodes}
         for future in as_completed(futures):
             completed += 1
             node, speed = future.result()
@@ -1927,12 +1974,54 @@ def bandwidth_filter(candidates):
                 results.append((node, speed))
             now = time.time()
             if now - last_print >= PROGRESS_PRINT_INTERVAL or completed == total:
-                print(f"\r[带宽测速] 进度：{completed}/{total} ({(completed/total)*100:.1f}%)", end="", flush=True)
+                print(f"\r[带宽测速/{label}] 进度：{completed}/{total} "
+                      f"({(completed/total)*100:.1f}%)", end="", flush=True)
                 last_print = now
-
     print()
     results.sort(key=lambda x: x[1], reverse=True)
     return results
+
+
+def bandwidth_filter(candidates):
+    """两段式测速（2026-10-27）。
+
+    阶段一：1MB 小样本 + 高并发，把所有候选快速过一遍；
+    阶段二：只对快筛靠前的 BANDWIDTH_STAGE2_TOP 个做完整样本精测。
+
+    改动原因：旧实现是「所有候选都用 BANDWIDTH_SIZE_MB 完整样本、低并发」。
+    候选一多就是几百 MB~GB 级流量，且慢节点长时间占住 worker —— 好节点排不
+    进来、样本还经常超时，最终只有个位数节点拿到有效速度。
+    """
+    if not candidates:
+        return []
+
+    if not shutil.which("curl"):
+        print("未检测到 curl 命令，带宽测速将跳过。")
+        return []
+
+    total = len(candidates)
+    quick_size = min(BANDWIDTH_SIZE_MB, BANDWIDTH_QUICK_SIZE_MB)
+    stage2_top = max(1, int(BANDWIDTH_STAGE2_TOP))
+
+    if total > stage2_top:
+        print(f"\n[带宽测速] 阶段一 快筛：{total} 个节点 × {quick_size}MB"
+              f"（并发 {BANDWIDTH_QUICK_WORKERS}，超时 {BANDWIDTH_QUICK_TIMEOUT}s）")
+        quick = _run_bandwidth_pass(candidates, quick_size, BANDWIDTH_QUICK_TIMEOUT,
+                                    BANDWIDTH_QUICK_WORKERS, "快筛")
+        if quick:
+            shortlist = [n for n, _ in quick[:stage2_top]]
+            print(f"[带宽测速] 快筛有效 {len(quick)} 个，取前 {len(shortlist)} 个进入精测")
+        else:
+            shortlist = list(candidates)[:stage2_top]
+            print(f"[带宽测速] 快筛无有效结果，直接对前 {len(shortlist)} 个精测")
+    else:
+        shortlist = list(candidates)
+
+    print(f"\n[带宽测速] 阶段二 精测：{len(shortlist)} 个节点 × {BANDWIDTH_SIZE_MB}MB"
+          f"（并发 {BANDWIDTH_WORKERS}，超时 {BANDWIDTH_TIMEOUT}s）")
+    return _run_bandwidth_pass(shortlist, BANDWIDTH_SIZE_MB, BANDWIDTH_TIMEOUT,
+                               BANDWIDTH_WORKERS, "精测")
+
 
 def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, target_count=None, latency_map=None, http_latency_map=None, http_jitter_map=None):
     if not CF_ENABLED:
@@ -2203,6 +2292,46 @@ def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, tar
                     print(final_error)
                     send_wxpusher_notification(content=final_error, summary="DNS 更新失败")
 
+def _sha256_of(path):
+    """算文件内容哈希，用于判断「这轮产出到底变没变」。"""
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def _push_marker_path(script_dir):
+    return os.path.join(script_dir, ".last_push.json")
+
+
+def _push_needed(script_dir, output_file):
+    """返回 (是否需要推送, 当前哈希)。"""
+    cur = _sha256_of(os.path.join(script_dir, output_file))
+    if not cur:
+        return True, ""
+    try:
+        with open(_push_marker_path(script_dir), "r", encoding="utf-8") as f:
+            prev = json.load(f).get("ip_sha", "")
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        prev = ""
+    return cur != prev, cur
+
+
+def _mark_pushed(script_dir, digest):
+    if not digest:
+        return
+    try:
+        with open(_push_marker_path(script_dir), "w", encoding="utf-8") as f:
+            json.dump({"ip_sha": digest, "at": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+    except OSError:
+        pass
+
+
 def sync_to_github():
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -2219,6 +2348,13 @@ def sync_to_github():
     if not os.path.exists(script_path):
         print(f"未找到 {script_name}，跳过 GitHub 同步。")
         return
+
+    # ---- 内容未变则跳过推送（2026-10-27）----
+    if PUSH_DEDUP_ENABLED:
+        _need, _digest = _push_needed(script_dir, OUTPUT_FILE)
+        if not _need:
+            print("ip.txt 内容与上次推送一致，跳过 GitHub 同步（省掉一轮 commit）。")
+            return
 
     if sys.platform != "win32":
         try:
@@ -2244,6 +2380,8 @@ def sync_to_github():
                 stdout, stderr = process.communicate(timeout=GIT_SYNC_PROCESS_TIMEOUT)
                 if process.returncode == 0:
                     print("已自动推送到 GitHub。")
+                    if PUSH_DEDUP_ENABLED:
+                        _mark_pushed(script_dir, _digest)
                     return
                 else:
                     print(f"推送失败 (退出码 {process.returncode})")
@@ -2436,6 +2574,20 @@ def main():
             print("过滤后无任何节点，退出程序。")
             sys.exit(0)
 
+    # ---- 死 IP 冷却表：跳过「连续失败且仍在冷却期」的节点（2026-10-27）----
+    _neg = None
+    if NEG_CACHE_ENABLED:
+        _neg = neg_cache.NegCache(NEG_CACHE_FILE, NEG_FAIL_THRESHOLD, NEG_COOLDOWN_RUNS)
+        _neg.begin_run()
+        _before_neg = len(nodes)
+        _filtered, _skipped = _neg.filter(nodes)
+        if _skipped and _filtered:
+            print(f"[冷却表] 跳过 {_skipped} 个冷却中的死节点"
+                  f"（{_before_neg} -> {len(_filtered)}），省下同等数量的 TCP 探测")
+            nodes = _filtered
+        elif _skipped:
+            print("[冷却表] 全部候选都在冷却中，本轮忽略冷却表直接全量测。")
+
     total = len(nodes)
     print(f"开始 TCP 连接测试（超时 {TIMEOUT}s，并发 {MAX_WORKERS}）...")
 
@@ -2453,6 +2605,19 @@ def main():
             if now - last_print >= PROGRESS_PRINT_INTERVAL or completed == total:
                 print(f"\r进度：{completed}/{total} ({(completed/total)*100:.1f}%)", end="", flush=True)
                 last_print = now
+
+    # ---- 回写冷却表：TCP 通过即清零，失败则累计 ----
+    if _neg is not None:
+        _ok_nodes = {r[0] for r in results}
+        for _n in nodes:
+            if _n in _ok_nodes:
+                _neg.record_ok(_n)
+            else:
+                _neg.record_fail(_n)
+        _neg.prune()
+        _neg.save()
+        _st = _neg.stats()
+        print(f"[冷却表] 已追踪 {_st['tracked']} 个节点，当前冷却 {_st['cooled']} 个")
 
     RUN_STATS["TCP通过"] = len(results)
     print("\nTCP 测试完成！")
@@ -2653,8 +2818,15 @@ def main():
             print(f"\n[提示] IPv4 保底 {_min_v4} 超过实测可用 {_avail_v4}，下调为 {_avail_v4}。")
             _min_v4 = _avail_v4
 
-    final_selected = _ensure_ipv6_representation(final_selected, _v6_pool, _min_v6)
-    final_selected = _ensure_ipv4_representation(final_selected, _v4_pool, _min_v4)
+    # 全量真实得分表：供保底顶替时挑选「最该被淘汰」的节点（2026-10-27）
+    _all_scores = {}
+    if _bw_ok:
+        _all_scores = {n: float(s) for n, s, *_ in scored_nodes}
+    else:
+        _all_scores = {n: 0.0 for n in candidates_after_http}
+
+    final_selected = _ensure_ipv6_representation(final_selected, _v6_pool, _min_v6, _all_scores)
+    final_selected = _ensure_ipv4_representation(final_selected, _v4_pool, _min_v4, _all_scores)
     print(f"\n[规模控制] 输出目标 {_top_cap} 个，其中 IPv4≥{_min_v4}、IPv6≥{_min_v6}。")
 
     # 回填：稳定性层宽限保留的节点本轮未测速，用其历史实测速度显示，
@@ -2692,6 +2864,18 @@ def main():
         else:
             line = f"{i}. {disp} {speed:.2f}Mbps"
         print(line)
+
+    # ============ 多样性约束（2026-10-27）============
+    # 同一 /24、同一 /16 扎堆会让「一段被墙 = 整份订阅失效」。按当前排序贪心保留。
+    if DIVERSITY_ENABLED and final_selected:
+        _before_div = len(final_selected)
+        final_selected, _div_dropped = ip_select.apply_diversity(
+            final_selected, MAX_PER_24, MAX_PER_16, MAX_PER_64)
+        if _div_dropped:
+            print(f"\n[多样性] 剔除 {len(_div_dropped)} 个同段扎堆节点"
+                  f"（{_before_div} -> {len(final_selected)}，"
+                  f"/24≤{MAX_PER_24}、/16≤{MAX_PER_16}、/64≤{MAX_PER_64}）")
+    # ==============================================
 
     # ============ 最小产出保护 ============
     # 产出明显低于历史水平时，保留旧 ip.txt、不更新 DNS、不推送 GitHub。
