@@ -1981,7 +1981,10 @@ def measure_bandwidth_curl(node_str, size_mb=None, timeout=None):
         try:
             result = subprocess.run(curl_cmd, capture_output=True, text=True,
                                     timeout=timeout + BANDWIDTH_PROCESS_BUFFER)
-            if result.returncode == 0 and result.stdout.strip():
+            # returncode 28 = 达到 --max-time 被截断；此时 curl 仍会输出已下载字节数，
+            # 只要够 min_valid_bytes 就仍能算出真实速度。旧实现只认 0，
+            # 会把「慢但可用」的节点（3~5Mbps）整批记成 0 丢弃。
+            if result.returncode in (0, 28) and result.stdout.strip():
                 parts = result.stdout.strip().split()
                 if len(parts) >= 3:
                     size_bytes = float(parts[0])
