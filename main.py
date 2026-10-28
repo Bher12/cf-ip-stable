@@ -567,6 +567,7 @@ def load_config():
         "WXPUSHER_APP_TOKEN": "your_app_token_here",
         "WXPUSHER_UIDS": ["your_uid_here"],
         "WXPUSHER_API_URL": "https://wxpusher.zjiecode.com/api/send/message",
+        "MAX_TCP_LATENCY_MS": 0,
         "PROJECT_TAG": "cf-ip-stable",
         "NOTIFY_TIMEOUT": 3,
         "NOTIFY_CONNECT_TIMEOUT": 3,
@@ -762,6 +763,7 @@ WXPUSHER_UIDS = (os.environ.get("WXPUSHER_UIDS").split(",")
                   else cfg["WXPUSHER_UIDS"])
 WXPUSHER_API_URL = cfg["WXPUSHER_API_URL"]
 PROJECT_TAG = cfg["PROJECT_TAG"]
+MAX_TCP_LATENCY_MS = int(cfg["MAX_TCP_LATENCY_MS"])
 NOTIFY_TIMEOUT = cfg["NOTIFY_TIMEOUT"]
 NOTIFY_CONNECT_TIMEOUT = cfg["NOTIFY_CONNECT_TIMEOUT"]
 CF_ENABLED = cfg["CF_ENABLED"]
@@ -1629,6 +1631,30 @@ def test_tcp_latency(ip, port, timeout=TIMEOUT, probes=TCP_PROBES):
     if success == 0:
         return float("inf"), 0
     return max_latency, success
+
+def _measure_latency_precise(nodes, workers=8, probes=2):
+    """低并发重测延迟，返回 {node: 毫秒}。
+
+    为什么需要单独测：主 TCP 阶段开了 MAX_WORKERS(300) 并发，本机网络栈被打满，
+    测出的握手延迟普遍虚高（实测 P50 达 1220ms），用它做「低延迟筛选」会误杀。
+    这里只对已经通过 HTTP 的几十个节点、用 8 并发重测一次，数值才可信。
+    """
+    def one(n):
+        m = IP_PORT_PATTERN.match(n)
+        if not m:
+            return (n, None)
+        lat, _ok = test_tcp_latency(m.group(1), m.group(2), timeout=3, probes=probes)
+        if lat == float("inf"):
+            return (n, None)
+        return (n, lat * 1000)
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for n, ms in ex.map(one, nodes):
+            if ms is not None:
+                out[n] = ms
+    return out
+
 
 def test_node(node_str):
     m = NODE_PATTERN.match(node_str)
@@ -2698,6 +2724,24 @@ def main():
     RUN_STATS["可用性通过"] = len(candidates_after_availability)
     candidates_after_http, http_latency_map, http_jitter_map = http_server_filter(candidates_after_availability, cfg)
     RUN_STATS["HTTP通过"] = len(candidates_after_http)
+
+    # ---- 低并发精测延迟 + 门槛（2026-10-28）----
+    # 本套定位「近 + 快」。注意：不能用 TCP 阶段的延迟来筛——那一阶段开了 300 并发，
+    # 本机网络被自己压满，测出的延迟普遍虚高到 1.2s（实测 P50=1220ms），
+    # 拿这种数据筛 180ms 只会把好节点全筛掉。这里改用低并发（8）重测。
+    if MAX_TCP_LATENCY_MS > 0 and candidates_after_http:
+        _precise = _measure_latency_precise(candidates_after_http, workers=8, probes=2)
+        _lats = sorted(_precise.values())
+        if _lats:
+            _p50 = _lats[len(_lats) // 2]
+            _keep = [n for n in candidates_after_http
+                     if _precise.get(n, 9e9) <= MAX_TCP_LATENCY_MS]
+            print(f"[延迟门槛] 低并发复测 {len(_precise)} 个节点，P50={_p50:.0f}ms；"
+                  f"≤{MAX_TCP_LATENCY_MS}ms 保留 {len(_keep)} 个（剔除 {len(candidates_after_http) - len(_keep)} 个）")
+            if _keep:
+                candidates_after_http = _keep
+            else:
+                print(f"[延迟门槛] 没有节点满足 ≤{MAX_TCP_LATENCY_MS}ms，本轮忽略该门槛（避免空产出）")
 
     bw_results = []
     for attempt in range(1, BANDWIDTH_RETRY_MAX + 1):
