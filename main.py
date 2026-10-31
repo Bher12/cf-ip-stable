@@ -36,6 +36,7 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 # 稳定性增强层（独立模块，与脚本同目录，可被单独自测）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import stability_layer
+import longconn_monitor
 
 # ===== SSL 校验策略 =====
 # 探测类请求（直连任意 IP、节点证书不可信）显式传 verify=False；
@@ -216,6 +217,90 @@ def generate_ipv6_candidates():
 
 def _is_ipv6_node(node_str):
     return node_str.startswith("[")
+
+
+def _split_host_port(node_str):
+    """把节点串拆成 (host, port)，兼容 IPv4 / IPv6 / 带 #标签。"""
+    host = node_str.split("#")[0]
+    if host.startswith("["):
+        h, _, p = host[1:].partition("]")
+        return h, (p.lstrip(":") or "443")
+    if ":" in host:
+        h, _, p = host.rpartition(":")
+        return h, p
+    return host, "443"
+
+
+def _tls_handshake_ms(host, port, timeout=3.0):
+    """做一次完整 TLS 握手，返回毫秒数；失败返回 None。"""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout) as sock:
+            start = time.perf_counter()
+            with ctx.wrap_socket(sock, server_hostname="speed.cloudflare.com"):
+                return (time.perf_counter() - start) * 1000.0
+    except (socket.timeout, OSError, ValueError, ssl.SSLError):
+        return None
+
+
+def measure_tls_latency(nodes, workers=16, probes=None):
+    """测量 TLS 握手耗时（SNI 固定 speed.cloudflare.com），返回 {node: 中位毫秒}。
+
+    为什么需要这个指标（2026-10-29 实测）：
+    只测 TCP 建连会漏掉「连得上但握手卡住」的节点。香港段 TCP 稳定在 29~36ms，
+    但 TLS 握手最差能到 1944ms —— 丢包触发重传，用户感知就是「点开要等两秒」。
+    只看 TCP 延迟的排序会把这类节点排到前面。
+    """
+    out = {}
+    if not nodes:
+        return out
+    _probes = max(1, int(probes if probes is not None else TLS_TEST_PROBES))
+
+    def one(node):
+        host, port = _split_host_port(node)
+        if not host:
+            return node, None
+        samples = []
+        for _ in range(_probes):
+            val = _tls_handshake_ms(host, port)
+            if val is not None:
+                samples.append(val)
+        if not samples:
+            return node, None
+        samples.sort()
+        n = len(samples)
+        med = samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2.0
+        return node, med
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for fut in as_completed([executor.submit(one, n) for n in nodes]):
+            node, val = fut.result()
+            if val is not None:
+                out[node] = val
+    return out
+
+
+def _effective_min_speed(node, base_lim, lat_map):
+    """低延迟豁免：延迟足够低的节点放宽带宽门槛。
+
+    背景（2026-10-29 实测）：移动 → CMI → 香港这条线 RTT 只有 30ms，
+    但单线程带宽只有 0.9~7.7Mbps，会被 8/10Mbps 的硬门槛整批误杀。
+    而 30ms + 3Mbps 的网页体验远好于 180ms + 30Mbps —— 页面通常只有几百 KB，
+    延迟主导，带宽早就够用。所以对低延迟节点单独降门槛，而不是一刀切。
+
+    LOW_LATENCY_EXEMPT_MS / LOW_LATENCY_MIN_SPEED_MBPS 任一为 0 即关闭本功能。
+    """
+    if _is_ipv6_node(node) or base_lim <= 0:
+        return base_lim
+    if LOW_LATENCY_EXEMPT_MS <= 0 or LOW_LATENCY_MIN_SPEED_MBPS <= 0:
+        return base_lim
+    lat = lat_map.get(node) if lat_map else None
+    if lat is None or lat > LOW_LATENCY_EXEMPT_MS:
+        return base_lim
+    return min(base_lim, LOW_LATENCY_MIN_SPEED_MBPS)
 
 
 def _node_port(node_str):
@@ -552,6 +637,7 @@ def load_config():
         "PER_COUNTRY_TOP_N": 1,
         "BANDWIDTH_CANDIDATES": 150,
         "TCP_PROBES": 1,
+        "TCP_LATENCY_STAT": "median",
         "MIN_SUCCESS_RATE": 1.0,
         "TCP_LATENCY_WEIGHT": 0.0,
         "TIMEOUT": 2.0,
@@ -661,6 +747,10 @@ def load_config():
         "BANDWIDTH_QUICK_WORKERS": 16,
         "BANDWIDTH_STAGE2_TOP": 40,
         "BANDWIDTH_IPV6_RESERVE": 12,
+        "LOW_LATENCY_EXEMPT_MS": 0.0,
+        "LOW_LATENCY_MIN_SPEED_MBPS": 0.0,
+        "TLS_LATENCY_WEIGHT": 0.0,
+        "TLS_TEST_PROBES": 2,
         "PUSH_DEDUP_ENABLED": True,
         "DIVERSITY_ENABLED": True,
         "MAX_PER_24": 2,
@@ -715,6 +805,8 @@ def load_config():
         "IPV6_PLACEHOLDER_COUNTRY": "IPV6",
         "IPV6_CANDIDATE_RESERVE": 30,
         "IPV6_MIN_IN_OUTPUT": 5,
+        "IPV6_MAX_IN_OUTPUT": 0,
+        "LOW_LATENCY_PRIORITY_MS": 0,
         "IPV4_MIN_IN_OUTPUT": 10,
     }
 
@@ -742,6 +834,7 @@ GLOBAL_TOP_N = cfg["GLOBAL_TOP_N"]
 PER_COUNTRY_TOP_N = cfg["PER_COUNTRY_TOP_N"]
 BANDWIDTH_CANDIDATES = cfg["BANDWIDTH_CANDIDATES"]
 TCP_PROBES = cfg["TCP_PROBES"]
+TCP_LATENCY_STAT = str(cfg.get("TCP_LATENCY_STAT", "median") or "median").lower()
 MIN_SUCCESS_RATE = cfg["MIN_SUCCESS_RATE"]
 TCP_LATENCY_WEIGHT = cfg["TCP_LATENCY_WEIGHT"]
 TIMEOUT = cfg["TIMEOUT"]
@@ -839,6 +932,10 @@ BANDWIDTH_QUICK_TIMEOUT = cfg["BANDWIDTH_QUICK_TIMEOUT"]
 BANDWIDTH_QUICK_WORKERS = cfg["BANDWIDTH_QUICK_WORKERS"]
 BANDWIDTH_STAGE2_TOP = cfg["BANDWIDTH_STAGE2_TOP"]
 BANDWIDTH_IPV6_RESERVE = int(cfg["BANDWIDTH_IPV6_RESERVE"])
+LOW_LATENCY_EXEMPT_MS = float(cfg.get("LOW_LATENCY_EXEMPT_MS", 0.0) or 0.0)
+LOW_LATENCY_MIN_SPEED_MBPS = float(cfg.get("LOW_LATENCY_MIN_SPEED_MBPS", 0.0) or 0.0)
+TLS_LATENCY_WEIGHT = float(cfg.get("TLS_LATENCY_WEIGHT", 0.0) or 0.0)
+TLS_TEST_PROBES = int(cfg.get("TLS_TEST_PROBES", 2) or 2)
 PUSH_DEDUP_ENABLED = cfg["PUSH_DEDUP_ENABLED"]
 DIVERSITY_ENABLED = cfg["DIVERSITY_ENABLED"]
 MAX_PER_24 = int(cfg["MAX_PER_24"])
@@ -888,6 +985,15 @@ IPV6_PORT = cfg["IPV6_PORT"]
 IPV6_PLACEHOLDER_COUNTRY = cfg["IPV6_PLACEHOLDER_COUNTRY"]
 IPV6_CANDIDATE_RESERVE = cfg["IPV6_CANDIDATE_RESERVE"]
 IPV6_MIN_IN_OUTPUT = cfg["IPV6_MIN_IN_OUTPUT"]
+IPV6_MAX_IN_OUTPUT = int(cfg.get("IPV6_MAX_IN_OUTPUT", 0) or 0)
+LOW_LATENCY_PRIORITY_MS = float(cfg.get("LOW_LATENCY_PRIORITY_MS", 0) or 0)
+LONGCONN_ENABLED = bool(cfg.get("LONGCONN_ENABLED", False))
+LONGCONN_TOP = int(cfg.get("LONGCONN_TOP", 12) or 12)
+LONGCONN_DURATION_SEC = int(cfg.get("LONGCONN_DURATION_SEC", 60) or 60)
+LONGCONN_INTERVAL_SEC = int(cfg.get("LONGCONN_INTERVAL_SEC", 5) or 5)
+LONGCONN_PROBE_TIMEOUT = int(cfg.get("LONGCONN_PROBE_TIMEOUT", 3) or 3)
+LONGCONN_MIN_SUCCESS_RATE = float(cfg.get("LONGCONN_MIN_SUCCESS_RATE", 0.9) or 0.9)
+LONGCONN_WORKERS = int(cfg.get("LONGCONN_WORKERS", 12) or 12)
 IPV4_MIN_IN_OUTPUT = cfg["IPV4_MIN_IN_OUTPUT"]
 
 # 记录本次运行中发生硬降级的环节（该层完全失效、退化为上一层的原始结果）。
@@ -1273,6 +1379,26 @@ def fetch_additional_source(url):
     if not url:
         return []
 
+    # 本地文件数据源（2026-10-29 新增）
+    # 允许在 ADDITIONAL_SOURCES 里直接写本地路径，方便放自建的优选列表
+    # （例如实测落在香港的 IP 段），不必先上传到公网再拉回来。
+    _local = url[7:] if url.startswith("file://") else url
+    if not _local.startswith(("http://", "https://")):
+        if not os.path.isabs(_local):
+            _local = os.path.join(os.path.dirname(os.path.abspath(__file__)), _local)
+        if os.path.exists(_local):
+            try:
+                with open(_local, "r", encoding="utf-8", errors="ignore") as _fh:
+                    _nodes = parse_adaptive(_fh.read())
+                print(f"从本地文件 {_local} 解析出 {len(_nodes)} 个节点。")
+                return _nodes
+            except Exception as _e:
+                print(f"读取本地数据源失败 ({_local}): {_e}")
+                return []
+        else:
+            print(f"本地数据源不存在，跳过: {_local}")
+            return []
+
     for attempt in range(1, FETCH_MAX_RETRIES + 1):
         try:
             print(f"正在请求数据源 {url} (尝试 {attempt}/{FETCH_MAX_RETRIES}) ...")
@@ -1614,23 +1740,35 @@ def test_tcp_latency(ip, port, timeout=TIMEOUT, probes=TCP_PROBES):
     is_v6 = ip.startswith("[")
     family = socket.AF_INET6 if is_v6 else socket.AF_INET
     host = ip[1:-1] if is_v6 else ip
-    max_latency = 0.0
-    success = 0
+    samples = []
     for _ in range(probes):
         try:
             start = time.time()
             with socket.socket(family, socket.SOCK_STREAM) as sock:
                 sock.settimeout(timeout)
                 sock.connect((host, int(port)))
-            latency = time.time() - start
-            if latency > max_latency:
-                max_latency = latency
-            success += 1
+            samples.append(time.time() - start)
         except Exception:
             continue
-    if success == 0:
+    if not samples:
         return float("inf"), 0
-    return max_latency, success
+
+    # 2026-10-29：默认改用中位数，与 HTTP 延迟的口径保持一致。
+    # 原来取 max 时，3 次探测里只要有 1 次赶上链路重传（约 1 秒），
+    # 该节点就会被记成 1000ms+ 而排到队尾 —— 这跟 HTTP 那段注释里写的
+    # 「取 max 会系统性偏向某一次特别慢的节点」是同一个问题，当时只改了 HTTP 一侧。
+    # 实测香港段中位 34ms、但约 15% 概率触发 1 秒重传，取 max 直接把它判死。
+    if TCP_LATENCY_STAT == "max":
+        return max(samples), len(samples)
+    samples.sort()
+    n = len(samples)
+    # 2026-10-30：偶数样本取「低中位数」，而不是两次求平均。
+    # 原因：probes=2 时求平均等价于 (好样本 + 坏样本)/2 —— 移动→CMI→香港段约 50%
+    # 概率撞上 1 秒重传，一次 30ms + 一次 1040ms 会被算成 535ms，随后被
+    # MAX_TCP_LATENCY_MS=250 的延迟门槛整批剔除。取低中位数（=两次取较小值）
+    # 才符合「链路真实 RTT」的语义，也与中位数抗重传的初衷一致。
+    med = samples[(n - 1) // 2]
+    return med, len(samples)
 
 def _measure_latency_precise(nodes, workers=8, probes=2):
     """低并发重测延迟，返回 {node: 毫秒}。
@@ -1720,9 +1858,12 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
     }
 
     test_rounds = max(3, HTTP_JITTER_SAMPLES)
-    # 允许的失败轮数：3 轮允许 1 轮抖动。此前任何一轮异常即判死节点，
-    # 网络瞬时拥塞会把整批节点连锁淘汰（实测同一批节点通过率可在 84% 与 0.7% 间跳变）。
-    allowed_fail = max(1, test_rounds // 3)
+    # 容错轮数（2026-10-30 修正）：原为 test_rounds // 3（3 轮允许 1 轮失败）。
+    # 实测移动→CMI→香港线路有 15-20% 概率触发 1 秒重传，3 轮里撞上 2 轮就被判死；
+    # 而失败节点紧接着单独重测 100% 通过（reason=cloudflare, 62-84ms）——说明是
+    # 瞬时抖动而非节点不可用。现放宽为「3 轮至少 1 轮成功」，可用性仍由后续
+    # 延迟门槛 / TLS 测量 / 带宽测速二次把关。
+    allowed_fail = max(1, test_rounds - 1)
     latencies = []
     failed_rounds = 0
     max_attempts = (max_retries + 1) if inner_retry_enabled else 1
@@ -1963,13 +2104,14 @@ def measure_bandwidth_curl(node_str, size_mb=None, timeout=None):
     # 两段式测速的快筛只下 1MB，而全局样本是 8MB，按 8MB 的 25% 算门槛(2MB)
     # 会让所有快筛样本被判无效，快筛永远返回 0（实测踩过）。
     min_valid_bytes = max(128 * 1024, int(size_mb * 1024 * 1024 * 0.25))
+    MAX_RATE_LIMIT_RETRY = 3
     samples = []
 
     for _ in range(max(1, samples_cfg)):
         curl_cmd = [
             "curl", "-s", "-o", null_device,
             # 输出：下载字节数 / 首字节时间 / 总时间
-            "-w", "%{size_download} %{time_starttransfer} %{time_total}",
+            "-w", "%{size_download} %{time_starttransfer} %{time_total} %{http_code}",
             "-L",
             "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "--noproxy", "*",
@@ -1978,25 +2120,39 @@ def measure_bandwidth_curl(node_str, size_mb=None, timeout=None):
             "--max-time", str(timeout),
         ] + insecure_flag + [url]   # 动态添加 --insecure（如果是 https）
 
-        try:
-            result = subprocess.run(curl_cmd, capture_output=True, text=True,
-                                    timeout=timeout + BANDWIDTH_PROCESS_BUFFER)
-            # returncode 28 = 达到 --max-time 被截断；此时 curl 仍会输出已下载字节数，
-            # 只要够 min_valid_bytes 就仍能算出真实速度。旧实现只认 0，
-            # 会把「慢但可用」的节点（3~5Mbps）整批记成 0 丢弃。
-            if result.returncode in (0, 28) and result.stdout.strip():
+        # 429 = speed.cloudflare.com 对出口 IP 限流（2026-11-01 新增）。
+        # Cloudflare anycast 节点（尤其落香港的 104.16/104.17 段）全部共享本机
+        # 出口 IP，测速配额一旦打满，整批节点都会被测成 0 字节，被速度门槛误杀。
+        # 实测同一批 IP 在限流窗口外能跑 300Mbps 以上，退避重试即可恢复。
+        for _rl in range(MAX_RATE_LIMIT_RETRY + 1):
+            try:
+                result = subprocess.run(curl_cmd, capture_output=True, text=True,
+                                        timeout=timeout + BANDWIDTH_PROCESS_BUFFER)
+                # returncode 28 = 达到 --max-time 被截断；此时 curl 仍会输出已下载字节数，
+                # 只要够 min_valid_bytes 就仍能算出真实速度。旧实现只认 0，
+                # 会把「慢但可用」的节点（3~5Mbps）整批记成 0 丢弃。
+                if not (result.returncode in (0, 28) and result.stdout.strip()):
+                    break
                 parts = result.stdout.strip().split()
-                if len(parts) >= 3:
-                    size_bytes = float(parts[0])
-                    ttfb = float(parts[1])
-                    time_total = float(parts[2])
-                    # 纯传输时间 = 总时间 - 首字节时间（扣除 TCP/TLS 握手与排队等待）
-                    transfer = time_total - ttfb
-                    if size_bytes >= min_valid_bytes and transfer > 0.05:
-                        speed_mbps = (size_bytes * 8) / (transfer * 1000 * 1000)
-                        samples.append(speed_mbps)
-        except Exception:
-            pass
+                if len(parts) < 3:
+                    break
+                size_bytes = float(parts[0])
+                ttfb = float(parts[1])
+                time_total = float(parts[2])
+                http_code = parts[3] if len(parts) >= 4 else "0"
+                if http_code == "429":
+                    if _rl < MAX_RATE_LIMIT_RETRY:
+                        time.sleep(2.0 * (_rl + 1))
+                        continue
+                    break
+                # 纯传输时间 = 总时间 - 首字节时间（扣除 TCP/TLS 握手与排队等待）
+                transfer = time_total - ttfb
+                if size_bytes >= min_valid_bytes and transfer > 0.05:
+                    speed_mbps = (size_bytes * 8) / (transfer * 1000 * 1000)
+                    samples.append(speed_mbps)
+                break
+            except Exception:
+                break
     # ----------------------------------------------------------
 
     if not samples:
@@ -2036,7 +2192,7 @@ def _run_bandwidth_pass(nodes, size_mb, timeout, workers, label):
     return results
 
 
-def bandwidth_filter(candidates):
+def bandwidth_filter(candidates, seed_nodes=None):
     """两段式测速（2026-10-27）。
 
     阶段一：1MB 小样本 + 高并发，把所有候选快速过一遍；
@@ -2052,6 +2208,35 @@ def bandwidth_filter(candidates):
     if not shutil.which("curl"):
         print("未检测到 curl 命令，带宽测速将跳过。")
         return []
+
+    # ---- 种子单独测速（2026-11-01）----
+    # Cloudflare anycast 种子（落香港的 104.16/104.17 段）全部共享本机出口 IP，
+    # speed.cloudflare.com 按出口 IP 有累计流量配额：实测 10MB 请求必返 429、
+    # 1MB 正常。批量测速会把配额打满，整批种子被测成 0 Mbps 被速度门槛误杀，
+    # 于是「延迟 25~31ms、实测 300Mbps 的香港节点一个都进不了结果」。
+    # 种子数量少且由人工维护，单独用 1MB 样本串行测（间隔 1s）避开限流。
+    seed_results = []
+    _seed_keys = {s.split('#')[0] for s in (seed_nodes or [])}
+    if _seed_keys:
+        _seed_list = [n for n in candidates if n.split('#')[0] in _seed_keys]
+        if _seed_list:
+            _seed_size = min(1.0, BANDWIDTH_QUICK_SIZE_MB)
+            print(f"\n[带宽测速] 种子单独测速：{len(_seed_list)} 个 × {_seed_size}MB"
+                  f"（串行 + 间隔 1s，规避 speed.cloudflare.com 的 429 限流）")
+            for _i, _n in enumerate(_seed_list, 1):
+                _node, _sp = measure_bandwidth_curl(_n, _seed_size,
+                                                    BANDWIDTH_QUICK_TIMEOUT)
+                if _sp > 0:
+                    seed_results.append((_node, _sp))
+                print(f"\r[带宽测速/种子] 进度：{_i}/{len(_seed_list)}"
+                      f" 有效 {len(seed_results)}", end="", flush=True)
+                time.sleep(1.0)
+            print()
+            candidates = [n for n in candidates
+                          if n.split('#')[0] not in _seed_keys]
+            if not candidates:
+                seed_results.sort(key=lambda x: x[1], reverse=True)
+                return seed_results
 
     total = len(candidates)
     quick_size = min(BANDWIDTH_SIZE_MB, BANDWIDTH_QUICK_SIZE_MB)
@@ -2084,8 +2269,15 @@ def bandwidth_filter(candidates):
 
     print(f"\n[带宽测速] 阶段二 精测：{len(shortlist)} 个节点 × {BANDWIDTH_SIZE_MB}MB"
           f"（并发 {BANDWIDTH_WORKERS}，超时 {BANDWIDTH_TIMEOUT}s）")
-    return _run_bandwidth_pass(shortlist, BANDWIDTH_SIZE_MB, BANDWIDTH_TIMEOUT,
-                               BANDWIDTH_WORKERS, "精测")
+    final = _run_bandwidth_pass(shortlist, BANDWIDTH_SIZE_MB, BANDWIDTH_TIMEOUT,
+                                BANDWIDTH_WORKERS, "精测")
+    if seed_results:
+        _have = {n.split('#')[0] for n, _ in final}
+        final = final + [(n, s) for n, s in seed_results
+                         if n.split('#')[0] not in _have]
+        final.sort(key=lambda x: x[1], reverse=True)
+        print(f"[带宽测速] 合并种子测速结果 {len(seed_results)} 个")
+    return final
 
 
 def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, target_count=None, latency_map=None, http_latency_map=None, http_jitter_map=None):
@@ -2570,13 +2762,25 @@ def main():
     if FILTER_COUNTRIES_ENABLED:
         print(f"前置白名单过滤：启用，仅保留：{', '.join(ALLOWED_COUNTRIES)}")
 
+    # 本地种子优先合并（2026-10-30）。
+    # ADDITIONAL_SOURCES 里的非 HTTP 条目是人工筛选的最优线路（如 移动→CMI→香港
+    # 172.66.0.0/24，30ms）。它们必须排在候选列表最前：Windows 动态端口只有 16384 个，
+    # 1.5 万个节点 × 3 次探测会产生 4.7 万次连接，TIME_WAIT 堆积后新连接直接失败。
+    # 排在列表末尾的节点整批探测全灭，被误判成死节点锁进冷却表——这正是低延迟
+    # 香港节点长期进不了产出的原因。
     nodes = []
+    _local_urls, _remote_urls = [], []
     for source in ADDITIONAL_SOURCES:
         if not source.get("enabled", True):
             continue
         url = source.get("url")
         if not url:
             continue
+        if url.lower().startswith(("http://", "https://")):
+            _remote_urls.append(url)
+        else:
+            _local_urls.append(url)
+    for url in _local_urls + _remote_urls:
         v2_nodes = fetch_additional_source(url)
         if v2_nodes:
             seen = set()
@@ -2641,11 +2845,36 @@ def main():
 
     # ---- 死 IP 冷却表：跳过「连续失败且仍在冷却期」的节点（2026-10-27）----
     _neg = None
+    _seed_nodes = set()
     if NEG_CACHE_ENABLED:
         _neg = neg_cache.NegCache(NEG_CACHE_FILE, NEG_FAIL_THRESHOLD, NEG_COOLDOWN_RUNS)
         _neg.begin_run()
+
+        # 本地种子节点豁免冷却（2026-10-30）。
+        # ADDITIONAL_SOURCES 里的非 HTTP 条目是人工筛选过的种子列表，通常就是
+        # 本地运营商最优线路（如 移动→CMI→香港 172.66.0.0/24，30ms）。
+        # 这类线路有偶发 1 秒重传，会在几轮里累计够失败次数被锁 6 轮，
+        # 而它们恰恰是整份列表里最该保留的低延迟节点。种子本身由人维护，
+        # 失效了人工删掉即可，不需要冷却表代劳。
+        _seed_nodes = set()
+        for _src in ADDITIONAL_SOURCES:
+            _u = (_src.get("url") if isinstance(_src, dict) else _src) or ""
+            if not _u or _u.lower().startswith(("http://", "https://")):
+                continue
+            _p = _u if os.path.isabs(_u) else os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), _u)
+            if os.path.exists(_p):
+                _seed_nodes.update(fetch_additional_source(_p))
+        _all_before_neg = list(nodes)
         _before_neg = len(nodes)
         _filtered, _skipped = _neg.filter(nodes)
+        if _seed_nodes:
+            _kept_set = set(_filtered)
+            _restored = [n for n in _all_before_neg
+                         if n in _seed_nodes and n not in _kept_set]
+            if _restored:
+                _filtered = _filtered + _restored
+                print(f"[冷却表] 本地种子 {len(_restored)} 个节点豁免冷却")
         if _skipped and _filtered:
             print(f"[冷却表] 跳过 {_skipped} 个冷却中的死节点"
                   f"（{_before_neg} -> {len(_filtered)}），省下同等数量的 TCP 探测")
@@ -2690,7 +2919,38 @@ def main():
         print("没有通过成功率筛选的节点，请检查网络或降低 MIN_SUCCESS_RATE。")
         sys.exit(0)
 
-    results.sort(key=lambda x: (-x[3], x[1]))
+    # ---- 本地种子低并发补测（2026-10-30）----
+    # 主 TCP 阶段开 300 并发，本机出口被自己打满：移动→CMI→香港段在这种压力下
+    # 2 秒超时内经常连不上，实测 10 个种子只有 1 个能过；同一批节点用 2 并发重测
+    # 却是 31ms 全通。种子数量只有个位数，单独低并发重测一次成本可忽略，
+    # 结果才代表这条线路的真实可用性（后续 HTTP / TLS / 带宽 / 延迟门槛照样把关）。
+    if _seed_nodes:
+        _seed_keys = {_s.split('#')[0] for _s in _seed_nodes}
+        _passed_keys = {r[0].split('#')[0] for r in results}
+        _retest = [_s for _s in _seed_nodes if _s.split('#')[0] not in _passed_keys]
+        if _retest:
+            _fixed = 0
+            for _n in _retest:
+                _m = IP_PORT_PATTERN.match(_n)
+                if not _m:
+                    continue
+                _lat, _succ = test_tcp_latency(_m.group(1), _m.group(2),
+                                               timeout=3, probes=3)
+                if _lat != float("inf") and (_succ / 3.0) >= MIN_SUCCESS_RATE:
+                    _country = _n.split('#')[-1].split()[0] if '#' in _n else ''
+                    results.append((_n, _lat, _country, _succ))
+                    _fixed += 1
+            print(f"[种子补测] {len(_retest)} 个种子在主阶段未通过，"
+                  f"低并发重测后恢复 {_fixed} 个")
+
+    # 排序以延迟为主、成功率为次（2026-10-30 修正）。
+    # 原实现按 (-success, latency) 排序：只要某节点 3 次探测中有 1 次超时，
+    # 它就会排到所有「3/3 全成功」的节点之后——而 3000+ 节点里 3/3 成功的
+    # 远超候选池名额（IPv4 只有 70 个），导致低延迟但偶发抖动的线路
+    # （如移动→CMI→香港 172.66.0.0/24，30ms 但 15-20% 概率 1 秒重传）
+    # 被系统性挤出候选池，最终只剩「稳定但慢」的节点。
+    # 成功率已由 MIN_SUCCESS_RATE 作为硬门槛把关，此处不应再主导排序。
+    results.sort(key=lambda x: (x[1], -x[3]))
     latency_map = {node: lat for node, lat, _, _ in results}
 
     if USE_GLOBAL_MODE:
@@ -2703,6 +2963,30 @@ def main():
         candidates += [n for n, _, _, _ in ipv6_results[:reserve]]
         print(f"\nTCP 最优前 {len(candidates)} 个节点进入候选池"
               f"（其中 IPv6 预留 {reserve} 个）。")
+
+        # 种子保送（2026-10-30）：本地种子（如 移动→CMI→香港 172.66.0.0/24）在主 TCP
+        # 阶段要和 300 并发抢本机带宽，测出的握手延迟被整体抬高，经常排不进前 N 名，
+        # 于是每轮都「有种子、却没进候选池」。种子是人工筛过的最优线路，只要通过
+        # TCP 成功率门槛就直接放进候选池最前；后面的 HTTP / TLS / 带宽 / 延迟门槛
+        # 照样逐层把关，不会因为保送而降低最终质量。
+        if _seed_nodes:
+            _seed_keys = {_s.split('#')[0] for _s in _seed_nodes}
+            _extra = [n for n, _, _, _ in results
+                      if n.split('#')[0] in _seed_keys and n not in candidates]
+            # 2026-11-01: 主 TCP 阶段开 300 并发，本机带宽被自己打满。
+            # Cloudflare anycast 种子（落香港的 104.16/104.17 段）在高并发下
+            # 3 次握手经常只成功 1 次，过不了 66% 成功率门槛，整批种子被丢弃，
+            # 于是每轮都是「种子明明活着、却一个都没进候选池」。
+            # 实测同一批 IP 低并发下 25/25 全部通过、握手 25~31ms。
+            # 因此未进入 results 的种子也一并保送，由后续 HTTP / TLS / 带宽 /
+            # 延迟门槛逐层把关，不会降低最终质量。
+            _passed = {n.split('#')[0] for n, _, _, _ in results}
+            _pending_seed = [s for s in _seed_nodes if s.split('#')[0] not in _passed]
+            _extra += [s for s in _pending_seed if s not in _extra]
+            if _extra:
+                candidates = _extra + candidates
+                print(f"[种子保送] {len(_extra)} 个本地种子进入候选池"
+                      f"（其中 {len(_pending_seed)} 个未过主TCP，交给低并发复测把关）")
     else:
         country_nodes = defaultdict(list)
         for node_str, lat, country, succ in results:
@@ -2734,22 +3018,57 @@ def main():
     # 拿这种数据筛 180ms 只会把好节点全筛掉。这里改用低并发（8）重测。
     if MAX_TCP_LATENCY_MS > 0 and candidates_after_http:
         _precise = _measure_latency_precise(candidates_after_http, workers=8, probes=2)
+        # 2026-10-30：未测到的节点不再直接按 9e9 判死。
+        # 旧实现用 _precise.get(n, 9e9)，只要 2 次探测都超时就当「无限慢」剔除；
+        # 实测 107 个 HTTP 通过的节点里有 56 个没测到，被静默淘汰一半，
+        # 香港种子也常在其中。这里补测一次，仍测不到则回退 TCP 阶段延迟。
+        _missing = [n for n in candidates_after_http if n not in _precise]
+        if _missing:
+            _precise.update(_measure_latency_precise(_missing, workers=4, probes=3))
+
+        def _lat_ms(_n):
+            _v = _precise.get(_n)
+            if _v is not None:
+                return _v
+            _t = latency_map.get(_n)
+            return float("inf") if _t is None else _t * 1000.0
+
         _lats = sorted(_precise.values())
         if _lats:
             _p50 = _lats[len(_lats) // 2]
             _keep = [n for n in candidates_after_http
-                     if _precise.get(n, 9e9) <= MAX_TCP_LATENCY_MS]
+                     if _lat_ms(n) <= MAX_TCP_LATENCY_MS]
+            _recovered = len([n for n in _keep if n in _missing])
             print(f"[延迟门槛] 低并发复测 {len(_precise)} 个节点，P50={_p50:.0f}ms；"
                   f"≤{MAX_TCP_LATENCY_MS}ms 保留 {len(_keep)} 个（剔除 {len(candidates_after_http) - len(_keep)} 个）")
+            if _missing:
+                print(f"[延迟门槛] 其中 {len(_missing)} 个首测未取到样本，补测/回退后救回 {_recovered} 个")
             if _keep:
                 candidates_after_http = _keep
             else:
                 print(f"[延迟门槛] 没有节点满足 ≤{MAX_TCP_LATENCY_MS}ms，本轮忽略该门槛（避免空产出）")
 
+    # ---- TLS 握手耗时测量（2026-10-29 新增）----
+    # 只测 TCP 建连会漏掉「连得上但握手卡住」的节点：香港段 TCP 稳定 29~36ms，
+    # 但 TLS 握手最差能到 1944ms（丢包触发重传），用户感知就是「点开要等两秒」。
+    # 权重 TLS_LATENCY_WEIGHT 为 0 时整段跳过，不产生额外开销。
+    tls_map = {}
+    if TLS_LATENCY_WEIGHT > 0 and candidates_after_http:
+        print(f"\n[TLS 测量] 对 {len(candidates_after_http)} 个节点测握手耗时"
+              f"（各 {TLS_TEST_PROBES} 次）...")
+        tls_map = measure_tls_latency(candidates_after_http)
+        if tls_map:
+            _tv = sorted(tls_map.values())
+            _tp50 = _tv[len(_tv) // 2]
+            print(f"[TLS 测量] 有效 {len(tls_map)}/{len(candidates_after_http)} 个，"
+                  f"P50={_tp50:.0f}ms，最慢={_tv[-1]:.0f}ms")
+        else:
+            print("[TLS 测量] 全部失败，本轮不启用该指标")
+
     bw_results = []
     for attempt in range(1, BANDWIDTH_RETRY_MAX + 1):
         print(f"\n[带宽测速] 第 {attempt} 轮测试...")
-        bw_results = bandwidth_filter(candidates_after_http)
+        bw_results = bandwidth_filter(candidates_after_http, _seed_nodes)
         # 下载速度阈值过滤：剔除低于设定阈值的节点，避免把 0 速/超低速节点发布出去。
         # IPv4 与 IPv6 分别用各自门槛（IPv6 链路天然较慢，同门槛会全数误杀）。
         if BANDWIDTH_MIN_SPEED_MBPS > 0 or BANDWIDTH_MIN_SPEED_MBPS_IPV6 > 0:
@@ -2757,7 +3076,10 @@ def main():
             _kept = []
             for _n, _sp in bw_results:
                 _is_v6 = _is_ipv6_node(_n)
-                _lim = BANDWIDTH_MIN_SPEED_MBPS_IPV6 if _is_v6 else BANDWIDTH_MIN_SPEED_MBPS
+                _lim = _effective_min_speed(
+                    _n,
+                    BANDWIDTH_MIN_SPEED_MBPS_IPV6 if _is_v6 else BANDWIDTH_MIN_SPEED_MBPS,
+                    latency_map)
                 if _lim <= 0 or _sp >= _lim:
                     _kept.append((_n, _sp))
             bw_results = _kept
@@ -2772,6 +3094,49 @@ def main():
         if attempt < BANDWIDTH_RETRY_MAX:
             print(f"本轮测速无有效结果，等待 {BANDWIDTH_RETRY_DELAY} 秒后重试...")
             time.sleep(BANDWIDTH_RETRY_DELAY)
+
+    # ---- 长连接稳定性监测（2026-10-31 流媒体AI版增强）----
+    # 模拟「看一段视频」：对带宽精测最快的节点持续探测一段时间，
+    # 统计连通率与延迟波动。断流节点直接剔除；抖动并入 HTTP 抖动惩罚；
+    # 连通率作为系数乘进评分（满分 1.0，越不稳分越低）。
+    _lc_factor = {}
+    if LONGCONN_ENABLED and bw_results:
+        _lc_nodes = [n for n, _ in bw_results[:LONGCONN_TOP]]
+        print(f"\n[长连接监测] 对前 {len(_lc_nodes)} 个节点持续探测 "
+              f"{LONGCONN_DURATION_SEC}s（间隔 {LONGCONN_INTERVAL_SEC}s，"
+              f"门槛连通率 {LONGCONN_MIN_SUCCESS_RATE*100:.0f}%）...")
+        lc_map = longconn_monitor.run_longconn_monitor(
+            _lc_nodes,
+            duration_sec=LONGCONN_DURATION_SEC,
+            interval_sec=LONGCONN_INTERVAL_SEC,
+            probe_timeout=LONGCONN_PROBE_TIMEOUT,
+            node_workers=LONGCONN_WORKERS)
+        if lc_map:
+            _before_lc = len(bw_results)
+            _failed = {n for n, m in lc_map.items()
+                       if m["success_rate"] < LONGCONN_MIN_SUCCESS_RATE}
+            if _failed:
+                bw_results = [(n, s) for n, s in bw_results
+                              if n not in _failed]
+                print(f"[长连接监测] {len(_failed)} 个节点监测期断流"
+                      f"（连通率低于 {LONGCONN_MIN_SUCCESS_RATE*100:.0f}%），"
+                      f"剔除：{_before_lc} -> {len(bw_results)}")
+            for n, m in lc_map.items():
+                if n in _failed:
+                    continue
+                _lc_factor[n] = m["success_rate"]
+                _old_j = http_jitter_map.get(n)
+                if _old_j is None or m["jitter_ms"] > _old_j:
+                    http_jitter_map[n] = m["jitter_ms"]
+            _bad = sorted((n for n, m in lc_map.items()
+                           if n not in _failed),
+                          key=lambda n: -lc_map[n]["jitter_ms"])
+            if _bad:
+                _b0 = _bad[0]
+                print(f"[长连接监测] 最抖节点：{_b0.split('#')[0]} "
+                      f"抖动 {lc_map[_b0]['jitter_ms']:.0f}ms / 平均 "
+                      f"{lc_map[_b0]['avg_ms']:.0f}ms / "
+                      f"连通率 {lc_map[_b0]['success_rate']*100:.0f}%")
 
     if not bw_results:
         print("\n带宽测速多次重试仍无有效结果，将使用 TCP 筛选结果作为最终节点。")
@@ -2798,8 +3163,18 @@ def main():
             http_jitter = http_jitter_map.get(node, 999999.0)
             http_lat_sec = http_lat / 1000.0
             http_jitter_sec = http_jitter / 1000.0
-            penalty = 1.0 + TCP_LATENCY_WEIGHT * tcp_lat + HTTP_LATENCY_WEIGHT * http_lat_sec + JITTER_WEIGHT * http_jitter_sec
+            # TLS 握手耗时：缺失时用 TCP 延迟 ×1.6 估算（TLS1.3 约多 1.5 个 RTT），
+            # 避免没有样本的节点反而因为「不加罚」而排到前面。
+            tls_lat = tls_map.get(node)
+            if tls_lat is None:
+                tls_lat = tcp_lat * 1.6
+            tls_lat_sec = tls_lat / 1000.0
+            penalty = (1.0 + TCP_LATENCY_WEIGHT * tcp_lat + HTTP_LATENCY_WEIGHT * http_lat_sec
+                       + JITTER_WEIGHT * http_jitter_sec + TLS_LATENCY_WEIGHT * tls_lat_sec)
             score = (SPEED_WEIGHT * speed) / penalty
+            # 长连接稳定系数：监测期断流过的节点按连通率打折（流媒体AI版）
+            if _lc_factor:
+                score *= _lc_factor.get(node, 1.0)
             scored_nodes.append((node, score, speed, tcp_lat, http_lat))
 
         scored_nodes.sort(key=lambda x: x[1], reverse=True)
@@ -2825,8 +3200,11 @@ def main():
                     _sp = speed_map.get(_n)
                     if _sp is None:
                         _sp = _hist_speed.get(_n, 0.0)
-                    _lim = (BANDWIDTH_MIN_SPEED_MBPS_IPV6 if _is_ipv6_node(_n)
-                            else BANDWIDTH_MIN_SPEED_MBPS)
+                    _lim = _effective_min_speed(
+                        _n,
+                        BANDWIDTH_MIN_SPEED_MBPS_IPV6 if _is_ipv6_node(_n)
+                        else BANDWIDTH_MIN_SPEED_MBPS,
+                        latency_map)
                     if _lim <= 0 or _sp >= _lim:
                         _kept.append(_n)
                     else:
@@ -2847,7 +3225,24 @@ def main():
             print(f"\n[稳定性层] 已发布 {len(final_selected)} 个节点"
                   f"（滞回/确认已生效，发布集合仅在被证实时变更）")
         elif USE_GLOBAL_MODE:
-            final_selected = [item[0] for item in scored_nodes[:GLOBAL_TOP_N]]
+            # IPv6 数量上限（2026-10-30）：IPv6 白名单只有 2a06:98c1:58 一个段，
+            # 从移动网络落地 LAX（205-209ms），但带宽 18-30Mbps 高于多数 IPv4，
+            # 评分排序会让它们刷屏占掉一半名额。上限把名额让给低延迟 IPv4。
+            # 0 表示不限制。
+            if IPV6_MAX_IN_OUTPUT > 0:
+                _sel, _v6n = [], 0
+                for _item in scored_nodes:
+                    if _is_ipv6_node(_item[0]):
+                        if _v6n >= IPV6_MAX_IN_OUTPUT:
+                            continue
+                        _v6n += 1
+                    _sel.append(_item[0])
+                    if len(_sel) >= GLOBAL_TOP_N:
+                        break
+                final_selected = _sel
+                print(f"\n[IPv6 限额] 最多 {IPV6_MAX_IN_OUTPUT} 个，实际入选 {_v6n} 个")
+            else:
+                final_selected = [item[0] for item in scored_nodes[:GLOBAL_TOP_N]]
         else:
             country_scored = defaultdict(list)
             for item in scored_nodes:
@@ -2930,6 +3325,23 @@ def main():
         _score_map = {item[0]: float(item[1]) for item in scored_nodes}
         final_selected.sort(key=lambda n: _score_map.get(n, 0.0), reverse=True)
 
+    # ---- 抖动/延迟数据校验（2026-11-01）----
+    # 稳定性层会「保留现任节点」（滞回机制），这些节点本轮未必重测过延迟，
+    # 于是出现「速度 30Mbps 看着不错、实际 HTTP 抖动 400~500ms」的僵尸条目，
+    # 对看视频是灾难（缓冲抖动 = 卡顿断流）。输出前按本轮实测数据校验：
+    # 没有本轮 HTTP 延迟样本的、或抖动超过阈值的，一律剔除；
+    # 但至少保留 5 个，避免过滤过头把产出清空。
+    _jit_limit = 200.0
+    if http_latency_map and len(final_selected) > 5:
+        _verified = [n for n in final_selected
+                     if n in http_latency_map
+                     and http_jitter_map.get(n, 0.0) <= _jit_limit]
+        if 5 <= len(_verified) < len(final_selected):
+            print(f"[抖动校验] 剔除 {len(final_selected) - len(_verified)} 个"
+                  f"（无本轮延迟样本或抖动 >{_jit_limit:.0f}ms），"
+                  f"保留 {len(_verified)} 个")
+            final_selected = _verified
+
     # IPv6 节点解析真实地区（仅展示用，放在全部筛选之后，不影响保活/过滤）
     _ipv6_geo = resolve_ipv6_countries(final_selected)
     display_overrides = {
@@ -2947,6 +3359,25 @@ def main():
         else:
             line = f"{i}. {disp} {speed:.2f}Mbps"
         print(line)
+
+    # ============ 低延迟优先排序（2026-10-30）============
+    # 评分公式是 speed / latency 的比值，带宽是线性因子、延迟只进 penalty，
+    # 所以低延迟但带宽低的线路永远排不过高带宽节点：
+    #   香港 3.05Mbps/31ms  -> score ≈ 5
+    #   日本 47.24Mbps/74ms -> score ≈ 55
+    # 实测把 TCP_LATENCY_WEIGHT 从 0 提到 200 都翻不过来（speed/lat 比值 96 vs 635）。
+    # 而用户要的恰恰是「延迟低」。所以这里做分组：延迟 ≤ 阈值的节点整体提到最前，
+    # 组内按实测带宽降序（同延迟下优先高带宽），其余节点保持原评分顺序。
+    if LOW_LATENCY_PRIORITY_MS > 0 and final_selected:
+        _spd = {n: s for n, s, *_ in scored_nodes}
+        _fast = [n for n in final_selected
+                 if (latency_map.get(n, 9e9) * 1000.0) <= LOW_LATENCY_PRIORITY_MS]
+        if _fast:
+            _fset = set(_fast)
+            _fast.sort(key=lambda n: -_spd.get(n, 0.0))
+            final_selected = _fast + [n for n in final_selected if n not in _fset]
+            print(f"\n[低延迟优先] {len(_fast)} 个节点（≤{LOW_LATENCY_PRIORITY_MS:.0f}ms）已提到列表最前")
+    # ==================================================
 
     # ============ 多样性约束（2026-10-27）============
     # 同一 /24、同一 /16 扎堆会让「一段被墙 = 整份订阅失效」。按当前排序贪心保留。
