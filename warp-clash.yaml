@@ -18,9 +18,9 @@ dns:
     - 223.5.5.5
     - 119.29.29.29
 proxies:
-  - name: "WARP-01 162.159.192.150 [699ms]"
+  - name: "WARP-01 188.114.99.80 [739ms]"
     type: wireguard
-    server: 162.159.192.150
+    server: 188.114.99.80
     port: 2408
     ip: 172.16.0.2
     ipv6: "2606:4700:110:8e69:a3a1:7ca8:85d9:e21"
@@ -36,9 +36,9 @@ proxies:
     dns:
       - 1.1.1.1
       - 1.0.0.1
-  - name: "WARP-02 188.114.97.2 [721ms]"
+  - name: "WARP-02 188.114.97.250 [759ms]"
     type: wireguard
-    server: 188.114.97.2
+    server: 188.114.97.250
     port: 2408
     ip: 172.16.0.2
     ipv6: "2606:4700:110:8e69:a3a1:7ca8:85d9:e21"
@@ -54,9 +54,9 @@ proxies:
     dns:
       - 1.1.1.1
       - 1.0.0.1
-  - name: "WARP-03 188.114.98.2 [737ms]"
+  - name: "WARP-03 188.114.96.2 [767ms]"
     type: wireguard
-    server: 188.114.98.2
+    server: 188.114.96.2
     port: 2408
     ip: 172.16.0.2
     ipv6: "2606:4700:110:8e69:a3a1:7ca8:85d9:e21"
@@ -72,79 +72,7 @@ proxies:
     dns:
       - 1.1.1.1
       - 1.0.0.1
-  - name: "WARP-04 188.114.99.10 [740ms]"
-    type: wireguard
-    server: 188.114.99.10
-    port: 2408
-    ip: 172.16.0.2
-    ipv6: "2606:4700:110:8e69:a3a1:7ca8:85d9:e21"
-    private-key: "UK6NL7YddbG5EtAH0Q0I2Bg1ruiuNSrwURmTW7b0gk4="
-    public-key: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-    udp: true
-    mtu: 1280
-    reserved:
-      - 0
-      - 0
-      - 0
-    remote-dns-resolve: true
-    dns:
-      - 1.1.1.1
-      - 1.0.0.1
-  - name: "WARP-05 188.114.99.50 [740ms]"
-    type: wireguard
-    server: 188.114.99.50
-    port: 2408
-    ip: 172.16.0.2
-    ipv6: "2606:4700:110:8e69:a3a1:7ca8:85d9:e21"
-    private-key: "UK6NL7YddbG5EtAH0Q0I2Bg1ruiuNSrwURmTW7b0gk4="
-    public-key: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-    udp: true
-    mtu: 1280
-    reserved:
-      - 0
-      - 0
-      - 0
-    remote-dns-resolve: true
-    dns:
-      - 1.1.1.1
-      - 1.0.0.1
-  - name: "WARP-06 188.114.99.150 [740ms]"
-    type: wireguard
-    server: 188.114.99.150
-    port: 2408
-    ip: 172.16.0.2
-    ipv6: "2606:4700:110:8e69:a3a1:7ca8:85d9:e21"
-    private-key: "UK6NL7YddbG5EtAH0Q0I2Bg1ruiuNSrwURmTW7b0gk4="
-    public-key: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-    udp: true
-    mtu: 1280
-    reserved:
-      - 0
-      - 0
-      - 0
-    remote-dns-resolve: true
-    dns:
-      - 1.1.1.1
-      - 1.0.0.1
-  - name: "WARP-07 162.159.192.30 [741ms]"
-    type: wireguard
-    server: 162.159.192.30
-    port: 2408
-    ip: 172.16.0.2
-    ipv6: "2606:4700:110:8e69:a3a1:7ca8:85d9:e21"
-    private-key: "UK6NL7YddbG5EtAH0Q0I2Bg1ruiuNSrwURmTW7b0gk4="
-    public-key: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-    udp: true
-    mtu: 1280
-    reserved:
-      - 0
-      - 0
-      - 0
-    remote-dns-resolve: true
-    dns:
-      - 1.1.1.1
-      - 1.0.0.1
-  - name: "WARP-08 188.114.96.10 [748ms]"
+  - name: "WARP-04 188.114.96.10 [782ms]"
     type: wireguard
     server: 188.114.96.10
     port: 2408
@@ -162,9 +90,9 @@ proxies:
     dns:
       - 1.1.1.1
       - 1.0.0.1
-  - name: "WARP-09 188.114.96.30 [748ms]"
+  - name: "WARP-05 188.114.96.50 [834ms]"
     type: wireguard
-    server: 188.114.96.30
+    server: 188.114.96.50
     port: 2408
     ip: 172.16.0.2
     ipv6: "2606:4700:110:8e69:a3a1:7ca8:85d9:e21"
@@ -180,9 +108,9 @@ proxies:
     dns:
       - 1.1.1.1
       - 1.0.0.1
-  - name: "WARP-10 188.114.98.5 [756ms]"
+  - name: "WARP-06 188.114.96.5 [857ms]"
     type: wireguard
-    server: 188.114.98.5
+    server: 188.114.96.5
     port: 2408
     ip: 172.16.0.2
     ipv6: "2606:4700:110:8e69:a3a1:7ca8:85d9:e21"
@@ -202,33 +130,25 @@ proxy-groups:
   - name: "WARP-自动"
     type: "url-test"
     proxies:
-      - "WARP-01 162.159.192.150 [699ms]"
-      - "WARP-02 188.114.97.2 [721ms]"
-      - "WARP-03 188.114.98.2 [737ms]"
-      - "WARP-04 188.114.99.10 [740ms]"
-      - "WARP-05 188.114.99.50 [740ms]"
-      - "WARP-06 188.114.99.150 [740ms]"
-      - "WARP-07 162.159.192.30 [741ms]"
-      - "WARP-08 188.114.96.10 [748ms]"
-      - "WARP-09 188.114.96.30 [748ms]"
-      - "WARP-10 188.114.98.5 [756ms]"
+      - "WARP-01 188.114.99.80 [739ms]"
+      - "WARP-02 188.114.97.250 [759ms]"
+      - "WARP-03 188.114.96.2 [767ms]"
+      - "WARP-04 188.114.96.10 [782ms]"
+      - "WARP-05 188.114.96.50 [834ms]"
+      - "WARP-06 188.114.96.5 [857ms]"
     url: "http://www.gstatic.com/generate_204"
-    interval: 120
-    tolerance: 50
+    interval: 60
+    tolerance: 100
   - name: "WARP-手动"
     type: select
     proxies:
       - "WARP-自动"
-      - "WARP-01 162.159.192.150 [699ms]"
-      - "WARP-02 188.114.97.2 [721ms]"
-      - "WARP-03 188.114.98.2 [737ms]"
-      - "WARP-04 188.114.99.10 [740ms]"
-      - "WARP-05 188.114.99.50 [740ms]"
-      - "WARP-06 188.114.99.150 [740ms]"
-      - "WARP-07 162.159.192.30 [741ms]"
-      - "WARP-08 188.114.96.10 [748ms]"
-      - "WARP-09 188.114.96.30 [748ms]"
-      - "WARP-10 188.114.98.5 [756ms]"
+      - "WARP-01 188.114.99.80 [739ms]"
+      - "WARP-02 188.114.97.250 [759ms]"
+      - "WARP-03 188.114.96.2 [767ms]"
+      - "WARP-04 188.114.96.10 [782ms]"
+      - "WARP-05 188.114.96.50 [834ms]"
+      - "WARP-06 188.114.96.5 [857ms]"
   - name: 节点选择
     type: select
     proxies:
