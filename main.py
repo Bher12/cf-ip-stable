@@ -3433,12 +3433,20 @@ def main():
 
     sync_to_github()
 
-    # ---- 成功完成通知：汇总本次结果 ----
+    # ---- 成功完成通知：汇总本次结果（含健康度漏斗） ----
     try:
         _degraded = list(DEGRADED_STAGES)
-        _lines = [f"共优选 {len(final_selected)} 个节点，已保存 {OUTPUT_FILE} 并同步到 GitHub。"]
+        _sync_txt = "并同步到 GitHub" if GITHUB_SYNC_MAX_RETRIES > 0 else ""
+        _lines = [f"共优选 {len(final_selected)} 个节点，已保存 {OUTPUT_FILE}{_sync_txt}。"]
         if final_selected:
             _lines.append(f"最快节点：{final_selected[0]}")
+        # 健康度漏斗：各阶段节点存量一览（借鉴 GFW Radar 连通健康度思路）
+        try:
+            _funnel = " → ".join(f"{k} {v}" for k, v in RUN_STATS.items() if v)
+            if _funnel:
+                _lines.append(f"健康度漏斗：{_funnel}")
+        except Exception:
+            pass
         if _degraded:
             _lines.append("降级环节：" + "、".join(_degraded))
         else:
