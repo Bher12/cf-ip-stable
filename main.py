@@ -1845,6 +1845,19 @@ def check_availability(node_str):
         if attempt < max_attempts - 1 and retry_delay > 0:
             time.sleep(retry_delay)
 
+    # SNI 直连兜底：外置可用性 API 拒判/超时的节点，只要能用 CF SNI 完成
+    # trace 握手，就是真实可用的 CF 入口（curl --resolve，实测 100% 可辨）
+    if not success:
+        try:
+            import colo_detect
+            ok, _lat, colo = colo_detect.sni_trace_probe(ip, port, timeout=AVAILABILITY_TIMEOUT)
+            if ok:
+                success = True
+                best_stack = "sni_direct"
+                best_exit_info = {"colo": colo}
+        except Exception:
+            pass
+
     return (node_str, success, best_stack, best_exit_info)
 
 def check_http_server(node_str, timeout, max_retries, retry_delay, method, connect_timeout, inner_retry_enabled):
