@@ -3408,6 +3408,30 @@ def main():
         return
     # =====================================
 
+    # ---- 落地机场（colo）识别：借鉴 GFW Radar 真实落地信息 ----
+    _colo_line = ""
+    if cfg.get("COLO_DETECT_ENABLED", True):
+        try:
+            import colo_detect
+            _colo_map = colo_detect.detect_colos(final_selected)
+            _detected = sum(1 for v in _colo_map.values() if v.get("colo"))
+            (final_selected, speed_map, latency_map,
+             http_latency_map, http_jitter_map) = colo_detect.retag_nodes(
+                final_selected, _colo_map,
+                speed_map=speed_map, latency_map=latency_map,
+                http_latency_map=http_latency_map, http_jitter_map=http_jitter_map)
+            # 注：stable 版排序由稳定性层+去重规则精心控制，这里只标注不重排
+            _dist_txt = colo_detect.format_distribution(final_selected)
+            print(f"\n落地机场识别完成（{_detected}/{len(final_selected)} 个节点）：")
+            for _n in final_selected:
+                print(f"  {_n}")
+            print("落地分布：" + _dist_txt)
+            RUN_STATS["落地机场"] = _detected
+            if _dist_txt:
+                _colo_line = f"落地分布：{_dist_txt}"
+        except Exception as _e:
+            print(f"落地机场识别失败（不影响主流程）: {_e}")
+
     write_ip_txt(final_selected, OUTPUT_FILE,
                  AD_HEADER_ENABLED, AD_HEADER_LINES,
                  AD_FOOTER_ENABLED, AD_FOOTER_LINES,
@@ -3451,6 +3475,8 @@ def main():
             _lines.append("降级环节：" + "、".join(_degraded))
         else:
             _lines.append("全部环节正常，无降级。")
+        if _colo_line:
+            _lines.append(_colo_line)
         send_wxpusher_notification(
             content="\n".join(_lines),
             summary=f"优选完成：{len(final_selected)} 个节点"
