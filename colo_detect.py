@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -56,32 +57,44 @@ def _parse_trace(text):
         return {}
 
 
+def sni_trace_probe(ip, port, timeout=4):
+    """SNI 直连探测原语：curl --resolve 强制把 SNI/Host 指向节点 IP。
+
+    这是识别「节点是否为真实可用 CF 入口」的可靠手段——实测对官方段
+    和合作 CDN 段都有效（裸 IP 直连或明文 HTTP 都会被 403/400 坑掉）。
+    返回 (ok, latency_ms, colo)，latency 含 curl 进程开销（约 10-30ms）。
+    """
+    curl_path = shutil.which("curl") or "curl"
+    resolve_ip = f"[{ip}]" if ":" in ip else ip
+    start = time.time()
+    try:
+        r = subprocess.run(
+            [curl_path, "-sk", "--max-time", str(int(timeout) + 2),
+             "--resolve", f"{_SNI_HOST}:{port}:{resolve_ip}",
+             f"https://{_SNI_HOST}:{port}/cdn-cgi/trace"],
+            capture_output=True, timeout=int(timeout) + 4, text=True)
+        lat = (time.time() - start) * 1000
+        fields = _parse_trace(r.stdout or "")
+        colo = (fields.get("colo") or "").strip().upper() or None
+        if colo:
+            return True, lat, colo
+        return False, lat, None
+    except Exception:
+        return False, (time.time() - start) * 1000, None
+
+
 def _detect_one(node_str, timeout):
-    """单节点落地识别：优先 HTTPS+SNI（curl --resolve，对官方段和合作段都有效），
-    其次退化到明文 HTTP 带 Host 头。"""
+    """单节点落地识别：SNI 直连探测优先，明文 HTTP 带 Host 头兜底。"""
     ip_port = node_str.split("#", 1)[0].strip()
     if ":" in ip_port:
         ip, port = ip_port.rsplit(":", 1)
     else:
         ip, port = ip_port, "443"
     host = _SNI_HOST
-    curl_path = shutil.which("curl") or "curl"
-    is_v6 = ":" in ip  # IPv6 地址本身含冒号
 
-    # 方式一：curl --resolve 强制 SNI+Host 指向节点 IP（推荐，覆盖最广）
-    try:
-        resolve_ip = f"[{ip}]" if is_v6 else ip
-        r = subprocess.run(
-            [curl_path, "-sk", "--max-time", str(int(timeout) + 2),
-             "--resolve", f"{host}:{port}:{resolve_ip}",
-             f"https://{host}:{port}/cdn-cgi/trace"],
-            capture_output=True, timeout=int(timeout) + 4, text=True)
-        fields = _parse_trace(r.stdout or "")
-        colo = (fields.get("colo") or "").strip().upper() or None
-        if colo:
-            return node_str, {"colo": colo, "status": 200}
-    except Exception:
-        pass
+    ok, _lat, colo = sni_trace_probe(ip, port, timeout=timeout)
+    if ok and colo:
+        return node_str, {"colo": colo, "status": 200}
 
     # 方式二：明文 HTTP 直连节点端口，Host 指向 CF 域名（部分节点 80 等端口可用）
     try:
