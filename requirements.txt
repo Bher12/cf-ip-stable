@@ -1,0 +1,10 @@
+# cf-ip-stable 运行依赖（Python 3.9+）
+# 安装：python -m pip install -r requirements.txt
+# 说明：setup.ps1 / setup.sh 仍会自动安装这些包，本文件用于换机复现与版本锁定。
+
+requests==2.34.2
+aiohttp==3.14.5
+urllib3==2.8.0
+
+# Cloudflare 返回 br 压缩时的解码支持（与 brotli 二选一，不要同时安装）
+brotlicffi==1.2.1.0

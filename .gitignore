@@ -3,11 +3,15 @@ git_sync.ps1
 git_sync.sh
 __pycache__/
 .run.lock
+
+# 日志（含轮转后的 *.log.1 / *.log.2）
 notify.log
 *.log
+*.log.*
 
 # local backups / temp
 *.bak
+*.bak.*
 *.bak_*
 _run.err
 
