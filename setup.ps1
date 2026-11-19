@@ -164,6 +164,13 @@ Write-Host "[4/4] 检查并安装 Python 依赖..." -ForegroundColor Green
 Write-Host "  升级 pip..." -ForegroundColor Gray
 & $PythonExePath -m pip install --upgrade pip --quiet
 
+# 优先按 requirements.txt 锁定版本安装（失败时由下方逐项安装兜底）
+$ReqFile = Join-Path $ScriptDir "requirements.txt"
+if (Test-Path $ReqFile) {
+    Write-Host "  按 requirements.txt 安装依赖..." -ForegroundColor Gray
+    & $PythonExePath -m pip install -r $ReqFile --quiet
+}
+
 # 检查并安装 requests
 if (Test-PyPackage -PythonExe $PythonExePath -Module "requests") {
     Write-Host "  ✅ requests 已安装" -ForegroundColor Gray
@@ -212,16 +219,37 @@ if (Test-PyPackage -PythonExe $PythonExePath -Module "brotlicffi") {
 }
 Write-Host ""
 
-# ---------- 创建 .gitignore 保护隐私 ----------
-Write-Host "正在创建 .gitignore..." -ForegroundColor Green
+# ---------- 创建 .gitignore 保护隐私（已存在则保留，避免覆盖本地规则）----------
 $GitignorePath = Join-Path $ScriptDir ".gitignore"
-@"
+if (-not (Test-Path $GitignorePath)) {
+    Write-Host "正在创建 .gitignore..." -ForegroundColor Green
+    @"
 config.json
 git_sync.ps1
 git_sync.sh
 __pycache__/
-"@ | Out-File -FilePath $GitignorePath -Encoding utf8 -Force
-Write-Host "✅ .gitignore 已创建`n" -ForegroundColor Gray
+.run.lock
+
+# 日志（含轮转后的 *.log.1 / *.log.2）
+*.log
+*.log.*
+
+# 本地备份副本
+*.bak
+*.bak.*
+
+# 本机运行时状态
+.fallback_streak
+.last_fallback_notify
+ipv6_geo_cache.json
+
+# 本机部署笔记（含网络状况与密钥操作细节，不对外公开）
+CHANGELOG_CONFIG_NOTES.md
+"@ | Out-File -FilePath $GitignorePath -Encoding utf8
+    Write-Host "✅ .gitignore 已创建`n" -ForegroundColor Gray
+} else {
+    Write-Host "✅ .gitignore 已存在，保留现有规则`n" -ForegroundColor Gray
+}
 
 # ---------- 验证 main.py 是否存在 ----------
 if (-not (Test-Path $PythonScriptPath)) {

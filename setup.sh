@@ -164,6 +164,12 @@ echo -e "${GREEN}[4/4] 检查并安装 Python 依赖...${NC}"
 echo -e "  升级 pip..."
 python3 -m pip install --upgrade pip --quiet
 
+# 优先按 requirements.txt 锁定版本安装（失败时由下方逐项安装兜底）
+if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
+    echo -e "  按 requirements.txt 安装依赖..."
+    python3 -m pip install -r "$SCRIPT_DIR/requirements.txt" --quiet
+fi
+
 # 检查并安装 requests
 if test_py_package "requests"; then
     echo -e "  ✅ requests 已安装"
@@ -212,15 +218,36 @@ else
 fi
 echo ""
 
-# ---------- 创建 .gitignore 保护隐私 ----------
-echo -e "${GREEN}正在创建 .gitignore...${NC}"
-cat > .gitignore << 'EOF'
+# ---------- 创建 .gitignore 保护隐私（已存在则保留，避免覆盖本地规则）----------
+if [ ! -f .gitignore ]; then
+    echo -e "${GREEN}正在创建 .gitignore...${NC}"
+    cat > .gitignore << 'EOF'
 config.json
 git_sync.ps1
 git_sync.sh
 __pycache__/
+.run.lock
+
+# 日志（含轮转后的 *.log.1 / *.log.2）
+*.log
+*.log.*
+
+# 本地备份副本
+*.bak
+*.bak.*
+
+# 本机运行时状态
+.fallback_streak
+.last_fallback_notify
+ipv6_geo_cache.json
+
+# 本机部署笔记（含网络状况与密钥操作细节，不对外公开）
+CHANGELOG_CONFIG_NOTES.md
 EOF
-echo -e "✅ .gitignore 已创建\n"
+    echo -e "✅ .gitignore 已创建\n"
+else
+    echo -e "✅ .gitignore 已存在，保留现有规则\n"
+fi
 
 # ---------- 验证 main.py 是否存在 ----------
 if [ ! -f "$PYTHON_SCRIPT" ]; then

@@ -51,3 +51,5 @@ create_task.ps1
 
 # IPv6 地理信息缓存（运行时产物，每次运行刷新）
 ipv6_geo_cache.json
+# 本机部署笔记（含网络状况与密钥操作细节，不对外公开）
+CHANGELOG_CONFIG_NOTES.md
